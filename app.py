@@ -26,6 +26,9 @@ initial_knowledge_data = [
     {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
     # ... 您可以加入更多自訂資料
 ]
+
+# 【新增】RAG 信心門檻：歐幾里得距離小於此值，視為高相關度
+RAG_CONFIDENCE_THRESHOLD = 1.0 
 # =============================================================
 
 
@@ -165,10 +168,10 @@ def query_knowledge_base(query_text, top_k=3):
     """
     從 SQLite 資料庫中檢索與查詢最相關的文檔。
     """
-    # 這裡的 query_embedding 呼叫現在已修復 (使用 contents)
     query_embedding = get_embedding(query_text)
     if not query_embedding:
-        return ""
+        # 【修正】現在返回兩個值：(上下文, 是否高相關度)
+        return "", False
 
     results = []
     
@@ -177,6 +180,8 @@ def query_knowledge_base(query_text, top_k=3):
     cursor.execute("SELECT content, embedding_json FROM knowledge_base")
     rows = cursor.fetchall()
     conn.close()
+
+    is_high_confidence = False
 
     for row in rows:
         content = row['content']
@@ -193,12 +198,16 @@ def query_knowledge_base(query_text, top_k=3):
     # 依距離排序 (距離小的排前面)
     results.sort(key=lambda x: x[0])
 
+    # 【新增邏輯】檢查最佳匹配的距離是否低於信心門檻
+    if results and results[0][0] < RAG_CONFIDENCE_THRESHOLD:
+        is_high_confidence = True
+
     # 選擇前 top_k 個結果，並組成上下文
     context = []
     for distance, content in results[:top_k]:
         context.append(content)
 
-    return "\n".join(context)
+    return "\n".join(context), is_high_confidence # 增加返回高相關度標記
 
 
 # Gemini 回覆函數
@@ -210,20 +219,36 @@ def GEMINI_response(user_text):
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
 
     # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
-    rag_context = query_knowledge_base(user_text, top_k=3)
+    # 【修正】現在接收兩個值：rag_context 和 is_high_confidence 標記
+    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=3)
     
     # 2. 組合提示詞 (Prompt Augmentation)
+    tools_config = [] # 預設不啟用 Google Search
+
     if rag_context:
         print(f"[RAG] 檢索到上下文:\n{rag_context[:50]}...")
-        # 告訴模型：如果相關，請根據提供的上下文回答。
-        system_instruction = (
-            "你是一位專業的客服助理。你的首要任務是根據使用者提問和提供的「CONTEXT」來回答問題。 "
-            "如果 CONTEXT 包含相關資訊，請使用它。如果 CONTEXT 不相關或無法回答，則使用你的通用知識 (Google Search) 回答。 "
-            f"CONTEXT:\n---\n{rag_context}\n---"
-        )
+        
+        if is_high_confidence:
+            # 【高相關度邏輯】強制模型優先使用 RAG 內容，並關閉 Google Search
+            print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容並禁用 Google Search。")
+            system_instruction = (
+                "你是一位專業的客服助理。你必須且只能根據提供的「CONTEXT」來回答問題，不得使用外部資訊。 "
+                "如果 CONTEXT 無法回答問題，請明確告知使用者資訊不足。 "
+                f"CONTEXT:\n---\n{rag_context}\n---"
+            )
+            tools_config = [] # 移除 Google Search
+        else:
+            # 【一般相關度邏輯】可以結合 Google Search
+            tools_config = [{"google_search": {}}] # 啟用 Google Search
+            system_instruction = (
+                "你是一位專業的客服助理。你的首要任務是根據使用者提問和提供的「CONTEXT」來回答問題。 "
+                "如果 CONTEXT 包含相關資訊，請使用它。如果 CONTEXT 不相關或無法回答，則使用你的通用知識 (Google Search) 回答。 "
+                f"CONTEXT:\n---\n{rag_context}\n---"
+            )
         final_prompt = user_text
     else:
-        # 如果沒有檢索到自訂資料，只使用通用知識 (Google Search)
+        # 沒有檢索到任何自訂資料，使用 Google Search
+        tools_config = [{"google_search": {}}]
         system_instruction = "你是一位樂於助人的助理，請使用最新資訊來回答問題。"
         final_prompt = user_text
 
@@ -233,12 +258,11 @@ def GEMINI_response(user_text):
 
     for attempt in range(max_retries):
         try:
-            # 【修正 2: 將 system_instruction 移入 config 物件中】
             config = types.GenerateContentConfig(
                 temperature=0.5, 
                 max_output_tokens=500,
-                # 啟用 Google Search 工具
-                tools=[{"google_search": {}}],
+                # 【修正】動態設定 tools
+                tools=tools_config,
                 # 傳入系統指令
                 system_instruction=system_instruction, 
             )
@@ -248,7 +272,6 @@ def GEMINI_response(user_text):
                 model="gemini-2.5-flash",
                 contents=final_prompt,
                 config=config,
-                # system_instruction 參數已移除，因為它現在在 config 內部
             )
 
             # 【內容檢查】
