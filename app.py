@@ -15,17 +15,16 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-# ======================= RAG 設定 =======================
+# ======================= 基本設定 =======================
 DB_FILE = "knowledge_base.db"
-
-initial_knowledge_data = [
-    {"content": "本公司的營業時間是週一至週五，早上九點到下午六點。"},
-    {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
-    {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
-]
-
 RAG_CONFIDENCE_THRESHOLD = 1.5  # 放寬門檻
-# ========================================================
+RESET_DB = True  # ✅ 首次部署時設定 True，初始化後改回 False
+# =========================================================
+
+# 🔹 如果設定為 True，自動刪除舊資料庫
+if RESET_DB and os.path.exists(DB_FILE):
+    os.remove(DB_FILE)
+    print("🗑 已刪除舊的 knowledge_base.db，將重新建立。")
 
 # 初始化 Flask
 app = Flask(__name__)
@@ -45,8 +44,7 @@ except Exception as e:
     print(f"初始化 Gemini 客戶端失敗: {e}")
     client = None
 
-
-# ============ SQLite 相關函數 ============
+# ======================= SQLite 相關 =======================
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -65,7 +63,7 @@ def setup_db():
     """)
     conn.commit()
     conn.close()
-    print("SQLite 資料庫設定完成。")
+    print("✅ SQLite 資料庫設定完成。")
 
 
 def euclidean_distance(vec1, vec2):
@@ -83,32 +81,34 @@ def get_embedding(text):
             model="text-embedding-004",
             contents=[text],
         )
-        return result.embeddings[0].values  # ✅ 改成正確格式
+        return result.embeddings[0].values  # ✅ 正確格式
     except Exception as e:
         print(f"[Embedding Error] {e}")
         return None
 
 
 def initialize_knowledge_base():
-    """第一次啟動建立初始資料"""
-    if not client:
-        return
-
+    """初始化預設知識"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM knowledge_base")
     count = cursor.fetchone()[0]
 
     if count == 0:
-        print("初始化 RAG 知識庫中...")
-        for item in initial_knowledge_data:
-            content = item["content"]
+        print("🔧 初始化 RAG 知識庫中...")
+        default_data = [
+            "本公司的營業時間是週一至週五，早上九點到下午六點。",
+            "退貨政策：非特價商品可在購買後30天內憑發票退貨。",
+            "技術支援請發送電子郵件至 support@mycompany.com。",
+            "工作考成分數是多少？工作考成分數為 6.5 分。",
+            "績效考評由部門主管負責，每年進行兩次。"
+        ]
+        for content in default_data:
             embedding = get_embedding(content)
             if embedding:
-                embedding_json = json.dumps(embedding)
                 cursor.execute(
                     "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
-                    (content, embedding_json),
+                    (content, json.dumps(embedding)),
                 )
         conn.commit()
         print("✅ RAG 知識庫初始化完成。")
@@ -121,21 +121,15 @@ def add_new_knowledge(content):
     if not embedding:
         print(f"[Error] 無法為內容生成 Embedding: {content[:30]}")
         return
-
     conn = get_db_connection()
     cursor = conn.cursor()
-    try:
-        embedding_json = json.dumps(embedding)
-        cursor.execute(
-            "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
-            (content, embedding_json),
-        )
-        conn.commit()
-        print(f"✅ 成功新增知識: {content[:30]}...")
-    except Exception as e:
-        print(f"[DB Error] {e}")
-    finally:
-        conn.close()
+    cursor.execute(
+        "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
+        (content, json.dumps(embedding)),
+    )
+    conn.commit()
+    conn.close()
+    print(f"✅ 成功新增知識: {content[:30]}...")
 
 
 def query_knowledge_base(query_text, top_k=3):
@@ -153,14 +147,12 @@ def query_knowledge_base(query_text, top_k=3):
 
     for row in rows:
         content = row["content"]
-        embedding_json = row["embedding_json"]
-        if not embedding_json:
-            continue
-        item_embedding = json.loads(embedding_json)
+        item_embedding = json.loads(row["embedding_json"])
         distance = euclidean_distance(query_embedding, item_embedding)
         results.append((distance, content))
 
     results.sort(key=lambda x: x[0])
+
     print(f"\n[RAG DEBUG] 查詢: {query_text}")
     for d, c in results[:3]:
         print(f"  距離 {d:.4f} → {c}")
@@ -169,12 +161,12 @@ def query_knowledge_base(query_text, top_k=3):
     context = "\n".join([c for _, c in results[:top_k]])
 
     if is_high_confidence:
-        print("[RAG] 命中高信心資料庫內容")
+        print("[RAG] 命中高信心資料庫內容 ✅")
 
     return context, is_high_confidence
 
 
-# ============ Gemini 回覆 ============
+# ======================= Gemini 回覆 =======================
 def GEMINI_response(user_text):
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化。"
@@ -213,18 +205,13 @@ def GEMINI_response(user_text):
             contents=user_text,
             config=config,
         )
-        if not response.text:
-            return "⚠️ 未獲得回覆。"
-        answer = response.text.strip()
-        if len(answer) > 2000:
-            answer = answer[:2000] + "…（回覆過長，已截斷）"
-        return answer
+        return response.text.strip() if response.text else "⚠️ 未獲得回覆。"
     except Exception as e:
         print(traceback.format_exc())
         return f"⚠️ 發生錯誤：{e}"
 
 
-# ============ LINE 事件處理 ============
+# ======================= Flask 路由 =======================
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature")
@@ -245,35 +232,21 @@ def handle_text_message(event):
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
 
-@handler.add(PostbackEvent)
-def handle_postback(event):
-    print(f"[Postback Data]: {event.postback.data}")
+@app.route("/resetdb", methods=["GET"])
+def reset_db():
+    """🔧 一鍵重建資料庫（Render用）"""
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+        print("🗑 已刪除舊 knowledge_base.db")
+    setup_db()
+    initialize_knowledge_base()
+    return "✅ 資料庫已重建完成。"
 
 
-@handler.add(MemberJoinedEvent)
-def welcome_new_member(event):
-    try:
-        uid = event.joined.members[0].user_id
-        if event.source.type == "group":
-            gid = event.source.group_id
-            profile = line_bot_api.get_group_member_profile(gid, uid)
-            name = profile.display_name
-        else:
-            name = "新朋友"
-        message = TextSendMessage(text=f"👋 歡迎 {name} 加入！我是由 Gemini 驅動的 AI 助手。")
-        line_bot_api.reply_message(event.reply_token, message)
-    except Exception:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="👋 歡迎新成員加入！"))
-
-
-# ============ 啟動 Flask ============
+# ======================= 啟動 Flask =======================
 if __name__ == "__main__":
     setup_db()
     initialize_knowledge_base()
-
-    # ✅ 寫入你想要的知識
-    add_new_knowledge("工作考成分數是多少？工作考成分數為 6.5 分。")
-    add_new_knowledge("績效考評由部門主管負責，每年進行兩次。")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
