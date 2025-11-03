@@ -6,10 +6,28 @@ from linebot.models import *
 import os
 import time
 import traceback
+import math 
+import sqlite3 # 引入 SQLite 函式庫
+import json # 引入 json 函式庫用於序列化向量
+
 # 引入 Google GenAI SDK
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+
+# ======================= RAG 知識庫設定 =======================
+# 【變更】使用 SQLite 檔案來持久化儲存資料
+DB_FILE = "knowledge_base.db" 
+
+# 初始資料 (只在資料庫第一次建立時使用)
+initial_knowledge_data = [
+    {"content": "本公司的營業時間是週一至週五，早上九點到下午六點。"},
+    {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
+    {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
+    # ... 您可以加入更多自訂資料
+]
+# =============================================================
+
 
 # 初始化 Flask
 app = Flask(__name__)
@@ -24,21 +42,158 @@ if not gemini_api_key:
     print("警告：未設定 GEMINI_API_KEY 環境變數！API 呼叫將會失敗。")
 
 # 初始化 Gemini Client
-# 客戶端會自動從環境變數 GEMINI_API_KEY 讀取金鑰
 try:
     client = genai.Client()
 except Exception as e:
     print(f"初始化 Gemini 客戶端失敗: {e}")
     client = None
 
+
+def get_db_connection():
+    """建立並返回 SQLite 資料庫連線。"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row # 讓資料以字典形式返回
+    return conn
+
+def setup_db():
+    """建立知識庫表格，如果它不存在。"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # 建立表格：content 儲存原始文本, embedding_json 儲存向量的 JSON 格式
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_base (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                embedding_json TEXT
+            );
+        """)
+        conn.commit()
+        conn.close()
+        print("SQLite 資料庫設定完成。")
+    except Exception as e:
+        print(f"SQLite 資料庫設定失敗: {e}")
+
+
+def euclidean_distance(vec1, vec2):
+    """計算兩個向量之間的歐幾里得距離 (距離越小，相似度越高)。"""
+    if len(vec1) != len(vec2):
+        return float('inf')
+    return math.sqrt(sum((v1 - v2) ** 2 for v1, v2 in zip(vec1, vec2)))
+
+
+def get_embedding(text):
+    """呼叫 Gemini API 取得文字的向量表示 (Embedding)。"""
+    if not client:
+        return None
+    try:
+        # 使用 text-embedding-004 模型生成向量
+        result = client.models.embed_content(
+            model='text-embedding-004',
+            content=text,
+            task_type='RETRIEVAL_DOCUMENT'
+        )
+        return result['embedding']
+    except Exception as e:
+        print(f"[Embedding Error] 無法生成向量: {e}")
+        return None
+
+
+def initialize_knowledge_base():
+    """檢查資料庫，如果沒有資料則插入初始資料並生成向量。"""
+    if not client:
+        return
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM knowledge_base")
+    count = cursor.fetchone()[0]
+
+    if count == 0:
+        print("正在初始化 RAG 知識庫 (生成 embeddings 並寫入資料庫)...")
+        for item in initial_knowledge_data:
+            content = item['content']
+            # 生成向量
+            embedding = get_embedding(content)
+            
+            if embedding:
+                # 將向量轉換為 JSON 字符串以便儲存在 SQLite
+                embedding_json = json.dumps(embedding)
+                cursor.execute(
+                    "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
+                    (content, embedding_json)
+                )
+        conn.commit()
+        print("RAG 知識庫初始化完成，資料已儲存到 knowledge_base.db。")
+    
+    conn.close()
+
+
+def query_knowledge_base(query_text, top_k=1):
+    """
+    從 SQLite 資料庫中檢索與查詢最相關的文檔。
+    """
+    query_embedding = get_embedding(query_text)
+    if not query_embedding:
+        return ""
+
+    results = []
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT content, embedding_json FROM knowledge_base")
+    rows = cursor.fetchall()
+    conn.close()
+
+    for row in rows:
+        content = row['content']
+        embedding_json = row['embedding_json']
+        
+        if embedding_json:
+            # 從 JSON 字符串還原為 Python 列表/向量
+            item_embedding = json.loads(embedding_json)
+            
+            # 計算相似度
+            distance = euclidean_distance(query_embedding, item_embedding)
+            results.append((distance, content))
+
+    # 依距離排序 (距離小的排前面)
+    results.sort(key=lambda x: x[0])
+
+    # 選擇前 top_k 個結果，並組成上下文
+    context = []
+    for distance, content in results[:top_k]:
+        context.append(content)
+
+    return "\n".join(context)
+
+
 # Gemini 回覆函數
 def GEMINI_response(user_text):
     """
-    呼叫 Google Gemini API (gemini-2.5-flash) 生成回覆，內含重試機制與錯誤處理。
-    同時啟用 Google Search 工具以處理需要即時資訊的問題。
+    呼叫 Google Gemini API，先進行 RAG 檢索，再將上下文與問題一起傳給模型。
     """
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY。"
+
+    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
+    rag_context = query_knowledge_base(user_text, top_k=1)
+    
+    # 2. 組合提示詞 (Prompt Augmentation)
+    if rag_context:
+        print(f"[RAG] 檢索到上下文:\n{rag_context[:50]}...")
+        # 告訴模型：如果相關，請根據提供的上下文回答。
+        system_instruction = (
+            "你是一位專業的客服助理。你的首要任務是根據使用者提問和提供的「CONTEXT」來回答問題。 "
+            "如果 CONTEXT 包含相關資訊，請使用它。如果 CONTEXT 不相關或無法回答，則使用你的通用知識 (Google Search) 回答。 "
+            f"CONTEXT:\n---\n{rag_context}\n---"
+        )
+        final_prompt = user_text
+    else:
+        # 如果沒有檢索到自訂資料，只使用通用知識 (Google Search)
+        system_instruction = "你是一位樂於助人的助理，請使用最新資訊來回答問題。"
+        final_prompt = user_text
+
 
     max_retries = 3
     delay = 2
@@ -46,66 +201,50 @@ def GEMINI_response(user_text):
     for attempt in range(max_retries):
         try:
             # 設置生成參數
-            # 【修正】將 tools 參數移入 config 內，符合 google-genai SDK 要求
+            # max_output_tokens 設為 1500 以處理複雜的搜尋結果
             config = types.GenerateContentConfig(
-                temperature=0.5,
-                max_output_tokens=500, # 限制最大輸出 Token 數量
-                # 修正：將 Google Search 工具放入 config 內
+                temperature=0.5, 
+                max_output_tokens=1500,
+                # 啟用 Google Search 工具
                 tools=[{"google_search": {}}],
             )
 
-            # 呼叫 Gemini API (使用最新的 gemini-2.5-flash 模型)
+            # 呼叫 Gemini API
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=user_text,
+                contents=final_prompt,
                 config=config,
-                # 修正：這裡不再需要 tools 參數
+                system_instruction=system_instruction # 傳入系統指令
             )
 
-            # 【關鍵修復】檢查是否有內容生成。如果 response.text 是 None，通常表示內容被阻擋或沒有輸出。
+            # 【內容檢查】
             if not response.text:
                 error_detail = "API 回應中無文字內容。"
-                
-                # 嘗試從 candidates 獲取更多資訊 (檢查被阻擋的原因)
                 if response.candidates:
-                    candidate = response.candidates[0]
-                    finish_reason = candidate.finish_reason.name
-                    
-                    if finish_reason == "SAFETY":
-                        # 內容被安全過濾器阻擋
-                        error_detail = "內容被安全過濾器阻擋，請嘗試調整提問。"
-                    elif finish_reason == "RECITATION":
-                        # 模型拒絕回應（例如：潛在違反使用政策，或需要外部知識但未成功獲取）
-                        error_detail = "模型拒絕回應，請嘗試提供更多情境或調整提問。"
-                    else:
-                        error_detail = f"模型完成原因: {finish_reason}，但沒有生成文字。"
-
+                    finish_reason = response.candidates[0].finish_reason.name
+                    error_detail = f"模型完成原因: {finish_reason}。"
                 print(f"[Gemini Error] Generation blocked or empty. Detail: {error_detail}")
-                # 返回更具體的錯誤訊息
                 return f"⚠️ 內容生成失敗：{error_detail}"
 
 
-            # 取出回答文字 (現在確定 response.text 不為 None)
+            # 取出回答文字
             answer = response.text.strip()
 
-            # LINE 限制訊息長度（最多約 2000 字元）
             if len(answer) > 2000:
                 answer = answer[:2000] + "…（回覆過長，已截斷）"
 
             return answer
 
         except APIError as e:
-            # 處理 Gemini API 相關錯誤，例如認證失敗、配額用盡等
             print(f"[Gemini API Error] {e}")
             if attempt < max_retries - 1:
                 print(f"等待 {delay} 秒後重試...")
                 time.sleep(delay)
-                delay *= 2  # 指數退避
+                delay *= 2
                 continue
             return "⚠️ 目前系統忙碌或 Gemini API 無法回應，請稍後再試。"
 
         except Exception as e:
-            # 處理其他未知錯誤，例如網路超時或解析錯誤
             print(traceback.format_exc())
             return "⚠️ 發生未知錯誤，請稍後再試。"
 
@@ -119,7 +258,6 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        # 處理簽章驗證失敗
         abort(400)
     return "OK"
 
@@ -147,7 +285,6 @@ def handle_postback(event):
 @handler.add(MemberJoinedEvent)
 def welcome_new_member(event):
     try:
-        # 嘗試獲取加入成員的名稱
         uid = event.joined.members[0].user_id
         if event.source.type == 'group':
             gid = event.source.group_id
@@ -165,6 +302,10 @@ def welcome_new_member(event):
 
 # ========= 啟動 Flask =========
 if __name__ == "__main__":
-    # 使用 Render 提供的 PORT 環境變數
+    # 【新增】應用程式啟動時先設定資料庫
+    setup_db()
+    # 【修正】在資料庫設定完成後，再初始化知識庫 (寫入資料)
+    initialize_knowledge_base() 
+    
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port)
