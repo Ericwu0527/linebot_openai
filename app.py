@@ -79,7 +79,7 @@ def get_embedding(text):
             model="text-embedding-004",
             contents=[text],
         )
-        return result.embeddings[0]
+        return result.embeddings[0].values  # ✅ 改這行：取出 list
     except Exception as e:
         print(f"[Embedding Error] {e}")
         return None
