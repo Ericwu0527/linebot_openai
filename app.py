@@ -236,7 +236,7 @@ def GEMINI_response(user_text):
             # 【修正 2: 將 system_instruction 移入 config 物件中】
             config = types.GenerateContentConfig(
                 temperature=0.5, 
-                max_output_tokens=1500,
+                max_output_tokens=500,
                 # 啟用 Google Search 工具
                 tools=[{"google_search": {}}],
                 # 傳入系統指令
