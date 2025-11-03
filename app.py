@@ -161,7 +161,7 @@ def add_new_knowledge(content):
         print(f"[Error] 無法為內容生成 Embedding: {content[:30]}...")
 
 
-def query_knowledge_base(query_text, top_k=1):
+def query_knowledge_base(query_text, top_k=3):
     """
     從 SQLite 資料庫中檢索與查詢最相關的文檔。
     """
@@ -210,7 +210,7 @@ def GEMINI_response(user_text):
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
 
     # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
-    rag_context = query_knowledge_base(user_text, top_k=1)
+    rag_context = query_knowledge_base(user_text, top_k=3)
     
     # 2. 組合提示詞 (Prompt Augmentation)
     if rag_context:
