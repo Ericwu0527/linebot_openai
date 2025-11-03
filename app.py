@@ -46,9 +46,12 @@ def GEMINI_response(user_text):
     for attempt in range(max_retries):
         try:
             # 設置生成參數
+            # 【修正】將 tools 參數移入 config 內，符合 google-genai SDK 要求
             config = types.GenerateContentConfig(
                 temperature=0.5,
                 max_output_tokens=500, # 限制最大輸出 Token 數量
+                # 修正：將 Google Search 工具放入 config 內
+                tools=[{"google_search": {}}],
             )
 
             # 呼叫 Gemini API (使用最新的 gemini-2.5-flash 模型)
@@ -56,8 +59,7 @@ def GEMINI_response(user_text):
                 model="gemini-2.5-flash",
                 contents=user_text,
                 config=config,
-                # 【關鍵修復與增強】加入 Google Search 工具，讓模型可以搜尋即時資訊 (如天氣)
-                tools=[{"google_search": {}}],
+                # 修正：這裡不再需要 tools 參數
             )
 
             # 【關鍵修復】檢查是否有內容生成。如果 response.text 是 None，通常表示內容被阻擋或沒有輸出。
