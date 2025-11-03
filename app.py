@@ -6,7 +6,10 @@ from linebot.models import *
 import os
 import time
 import traceback
-from openai import OpenAI, OpenAIError
+# 引入 Google GenAI SDK
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
 
 # 初始化 Flask
 app = Flask(__name__)
@@ -15,30 +18,49 @@ app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 
-# 初始化 OpenAI Client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# 從環境變數獲取 Gemini API Key (請確保您的環境變數名稱為 GEMINI_API_KEY)
+gemini_api_key = os.getenv('GEMINI_API_KEY')
+if not gemini_api_key:
+    print("警告：未設定 GEMINI_API_KEY 環境變數！API 呼叫將會失敗。")
 
-# GPT 回覆函數
-def GPT_response(user_text):
+# 初始化 Gemini Client
+# 客戶端會自動從環境變數 GEMINI_API_KEY 讀取金鑰
+try:
+    client = genai.Client()
+except Exception as e:
+    print(f"初始化 Gemini 客戶端失敗: {e}")
+    client = None
+
+# Gemini 回覆函數
+def GEMINI_response(user_text):
     """
-    呼叫 OpenAI GPT 生成回覆，內含重試機制與錯誤處理。
+    呼叫 Google Gemini API (gemini-2.5-flash) 生成回覆，內含重試機制與錯誤處理。
     """
+    if not client:
+        return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY。"
+
     max_retries = 3
     delay = 2
 
     for attempt in range(max_retries):
         try:
-            # 使用最新 API (Responses endpoint)
-            response = client.responses.create(
-                model="gpt-4o-mini",  # 最新模型，效能佳
-                input=user_text,
+            # 設置生成參數
+            config = types.GenerateContentConfig(
                 temperature=0.5,
-                max_output_tokens=500,
-                timeout=15,  # 秒數：防止超時
+                max_output_tokens=500, # 限制最大輸出 Token 數量
+            )
+
+            # 呼叫 Gemini API (使用最新的 gemini-2.5-flash 模型)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_text,
+                config=config,
+                # 這裡不需設定 timeout，因為 SDK 內部處理
             )
 
             # 取出回答文字
-            answer = response.output[0].content[0].text.strip()
+            # Gemini SDK 使用 response.text 屬性來獲取內容
+            answer = response.text.strip()
 
             # LINE 限制訊息長度（最多約 2000 字元）
             if len(answer) > 2000:
@@ -46,16 +68,18 @@ def GPT_response(user_text):
 
             return answer
 
-        except OpenAIError as e:
-            print(f"[OpenAI API Error] {e}")
+        except APIError as e:
+            # 處理 Gemini API 相關錯誤，例如認證失敗、配額用盡等
+            print(f"[Gemini API Error] {e}")
             if attempt < max_retries - 1:
                 print(f"等待 {delay} 秒後重試...")
                 time.sleep(delay)
                 delay *= 2  # 指數退避
                 continue
-            return "⚠️ 目前系統忙碌或 API 無法回應，請稍後再試。"
+            return "⚠️ 目前系統忙碌或 Gemini API 無法回應，請稍後再試。"
 
         except Exception as e:
+            # 處理其他未知錯誤，例如網路超時或解析錯誤
             print(traceback.format_exc())
             return "⚠️ 發生未知錯誤，請稍後再試。"
 
@@ -69,6 +93,7 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        # 處理簽章驗證失敗
         abort(400)
     return "OK"
 
@@ -78,30 +103,42 @@ def handle_text_message(event):
     user_msg = event.message.text
     print(f"[User Message]: {user_msg}")
 
-    reply_text = GPT_response(user_msg)
-    print(f"[GPT Reply]: {reply_text}")
+    # 改為呼叫 Gemini 回覆函數
+    reply_text = GEMINI_response(user_msg)
+    print(f"[Gemini Reply]: {reply_text}")
 
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_text)
     )
 
-# ========= 處理 Postback =========
+# ========= 處理 Postback (維持原樣) =========
 @handler.add(PostbackEvent)
 def handle_postback(event):
     print(f"[Postback Data]: {event.postback.data}")
 
-# ========= 處理加入群組事件 =========
+# ========= 處理加入群組事件 (微調歡迎訊息) =========
 @handler.add(MemberJoinedEvent)
 def welcome_new_member(event):
-    uid = event.joined.members[0].user_id
-    gid = event.source.group_id
-    profile = line_bot_api.get_group_member_profile(gid, uid)
-    name = profile.display_name
-    message = TextSendMessage(text=f"👋 歡迎 {name} 加入群組！")
-    line_bot_api.reply_message(event.reply_token, message)
+    try:
+        # 嘗試獲取加入成員的名稱
+        uid = event.joined.members[0].user_id
+        if event.source.type == 'group':
+            gid = event.source.group_id
+            profile = line_bot_api.get_group_member_profile(gid, uid)
+            name = profile.display_name
+        else:
+            name = "新朋友"
+            
+        message = TextSendMessage(text=f"👋 歡迎 {name} 加入！我是由 Gemini 驅動的 AI 助手。")
+        line_bot_api.reply_message(event.reply_token, message)
+    except Exception as e:
+        print(f"發送歡迎訊息失敗: {e}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"👋 歡迎新成員加入！"))
+
 
 # ========= 啟動 Flask =========
 if __name__ == "__main__":
+    # 使用 Render 提供的 PORT 環境變數
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port)
