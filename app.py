@@ -304,8 +304,14 @@ def welcome_new_member(event):
 if __name__ == "__main__":
     # 【新增】應用程式啟動時先設定資料庫
     setup_db()
-    # 【修正】在資料庫設定完成後，再初始化知識庫 (寫入資料)
+    # 【修正】在資料庫設定完成後，再初始化知識庫 (寫入初始資料)
     initialize_knowledge_base() 
+    
+    # 【範例：寫入您的新知識】
+    # 1. 寫入具體的考成分數資訊
+    add_new_knowledge("工作考成分數為 6.5 分。")
+    # 2. 寫入另一個範例，例如：誰負責考評
+    add_new_knowledge("績效考評由部門主管負責，每年進行兩次。")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port)
