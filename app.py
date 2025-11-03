@@ -87,12 +87,13 @@ def get_embedding(text):
     if not client:
         return None
     try:
-        # 使用 text-embedding-004 模型生成向量
+        # 【修正 1: 將 'content' 改為 'contents'，並將 text 放入列表中】
         result = client.models.embed_content(
             model='text-embedding-004',
-            content=text,
+            contents=[text], # 這裡需要傳遞一個包含文本的列表
             task_type='RETRIEVAL_DOCUMENT'
         )
+        # result['embedding'] 包含單個文本的向量
         return result['embedding']
     except Exception as e:
         print(f"[Embedding Error] 無法生成向量: {e}")
@@ -129,10 +130,42 @@ def initialize_knowledge_base():
     conn.close()
 
 
+def add_new_knowledge(content):
+    """
+    將新的內容添加到知識庫資料庫，並自動生成向量。
+    """
+    if not client:
+        print("無法新增知識：Gemini 客戶端未初始化。")
+        return
+        
+    embedding = get_embedding(content)
+    
+    if embedding:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        embedding_json = json.dumps(embedding)
+        
+        # 這裡直接插入新資料，您也可以加入邏輯檢查內容是否重複
+        try:
+            cursor.execute(
+                "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
+                (content, embedding_json)
+            )
+            conn.commit()
+            print(f"[Success] 成功新增知識到資料庫: {content[:30]}...")
+        except Exception as e:
+            print(f"[Error] 新增知識失敗: {e}")
+        finally:
+            conn.close()
+    else:
+        print(f"[Error] 無法為內容生成 Embedding: {content[:30]}...")
+
+
 def query_knowledge_base(query_text, top_k=1):
     """
     從 SQLite 資料庫中檢索與查詢最相關的文檔。
     """
+    # 這裡的 query_embedding 呼叫現在已修復 (使用 contents)
     query_embedding = get_embedding(query_text)
     if not query_embedding:
         return ""
@@ -174,7 +207,7 @@ def GEMINI_response(user_text):
     呼叫 Google Gemini API，先進行 RAG 檢索，再將上下文與問題一起傳給模型。
     """
     if not client:
-        return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY。"
+        return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
 
     # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
     rag_context = query_knowledge_base(user_text, top_k=1)
@@ -200,13 +233,14 @@ def GEMINI_response(user_text):
 
     for attempt in range(max_retries):
         try:
-            # 設置生成參數
-            # max_output_tokens 設為 1500 以處理複雜的搜尋結果
+            # 【修正 2: 將 system_instruction 移入 config 物件中】
             config = types.GenerateContentConfig(
                 temperature=0.5, 
                 max_output_tokens=1500,
                 # 啟用 Google Search 工具
                 tools=[{"google_search": {}}],
+                # 傳入系統指令
+                system_instruction=system_instruction, 
             )
 
             # 呼叫 Gemini API
@@ -214,7 +248,7 @@ def GEMINI_response(user_text):
                 model="gemini-2.5-flash",
                 contents=final_prompt,
                 config=config,
-                system_instruction=system_instruction # 傳入系統指令
+                # system_instruction 參數已移除，因為它現在在 config 內部
             )
 
             # 【內容檢查】
