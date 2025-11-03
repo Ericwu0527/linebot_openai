@@ -97,8 +97,8 @@ def get_embedding(text):
             contents=[text], # 這裡需要傳遞一個包含文本的列表
             # 移除了 task_type='RETRIEVAL_DOCUMENT'
         )
-        # result['embedding'] 包含單個文本的向量
-        return result['embedding']
+        # 【修正 4: 將字典索引 ['embedding'] 改為物件屬性 .embeddings[0]】
+        return result.embeddings[0]
     except Exception as e:
         print(f"[Embedding Error] 無法生成向量: {e}")
         return None
