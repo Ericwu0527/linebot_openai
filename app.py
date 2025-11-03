@@ -91,10 +91,11 @@ def get_embedding(text):
         return None
     try:
         # 【修正 1: 將 'content' 改為 'contents'，並將 text 放入列表中】
+        # 【修正 3: 移除 'task_type' 參數，解決 API 呼叫錯誤】
         result = client.models.embed_content(
             model='text-embedding-004',
             contents=[text], # 這裡需要傳遞一個包含文本的列表
-            task_type='RETRIEVAL_DOCUMENT'
+            # 移除了 task_type='RETRIEVAL_DOCUMENT'
         )
         # result['embedding'] 包含單個文本的向量
         return result['embedding']
@@ -260,7 +261,7 @@ def GEMINI_response(user_text):
         try:
             config = types.GenerateContentConfig(
                 temperature=0.5, 
-                max_output_tokens=500,
+                max_output_tokens=1500,
                 # 【修正】動態設定 tools
                 tools=tools_config,
                 # 傳入系統指令
