@@ -171,16 +171,23 @@ def query_knowledge_base(query_text, top_k=3):
     """
     query_embedding = get_embedding(query_text)
     if not query_embedding:
-        # 【修正】現在返回兩個值：(上下文, 是否高相關度)
+        # 如果無法生成查詢向量，則無法進行 RAG 檢索
         return "", False
 
     results = []
     
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT content, embedding_json FROM knowledge_base")
-    rows = cursor.fetchall()
-    conn.close()
+    # 【修正：增加 try/except 處理資料庫查詢錯誤】
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT content, embedding_json FROM knowledge_base")
+        rows = cursor.fetchall()
+    except Exception as e:
+        print(f"[DB Query Error] 無法查詢知識庫: {e}")
+        # 如果資料庫查詢失敗，返回空結果，應用程式不會崩潰
+        return "", False 
+    finally:
+        conn.close()
 
     is_high_confidence = False
 
