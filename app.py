@@ -35,6 +35,7 @@ except Exception as e:
 def GEMINI_response(user_text):
     """
     呼叫 Google Gemini API (gemini-2.5-flash) 生成回覆，內含重試機制與錯誤處理。
+    同時啟用 Google Search 工具以處理需要即時資訊的問題。
     """
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY。"
@@ -55,11 +56,34 @@ def GEMINI_response(user_text):
                 model="gemini-2.5-flash",
                 contents=user_text,
                 config=config,
-                # 這裡不需設定 timeout，因為 SDK 內部處理
+                # 【關鍵修復與增強】加入 Google Search 工具，讓模型可以搜尋即時資訊 (如天氣)
+                tools=[{"google_search": {}}],
             )
 
-            # 取出回答文字
-            # Gemini SDK 使用 response.text 屬性來獲取內容
+            # 【關鍵修復】檢查是否有內容生成。如果 response.text 是 None，通常表示內容被阻擋或沒有輸出。
+            if not response.text:
+                error_detail = "API 回應中無文字內容。"
+                
+                # 嘗試從 candidates 獲取更多資訊 (檢查被阻擋的原因)
+                if response.candidates:
+                    candidate = response.candidates[0]
+                    finish_reason = candidate.finish_reason.name
+                    
+                    if finish_reason == "SAFETY":
+                        # 內容被安全過濾器阻擋
+                        error_detail = "內容被安全過濾器阻擋，請嘗試調整提問。"
+                    elif finish_reason == "RECITATION":
+                        # 模型拒絕回應（例如：潛在違反使用政策，或需要外部知識但未成功獲取）
+                        error_detail = "模型拒絕回應，請嘗試提供更多情境或調整提問。"
+                    else:
+                        error_detail = f"模型完成原因: {finish_reason}，但沒有生成文字。"
+
+                print(f"[Gemini Error] Generation blocked or empty. Detail: {error_detail}")
+                # 返回更具體的錯誤訊息
+                return f"⚠️ 內容生成失敗：{error_detail}"
+
+
+            # 取出回答文字 (現在確定 response.text 不為 None)
             answer = response.text.strip()
 
             # LINE 限制訊息長度（最多約 2000 字元）
