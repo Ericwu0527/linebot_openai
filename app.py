@@ -214,6 +214,10 @@ def GEMINI_response(user_text):
 # ======================= Flask 路由 =======================
 @app.route("/callback", methods=["POST"])
 def callback():
+    # ✅ 確保資料庫存在
+    setup_db()
+    initialize_knowledge_base()
+
     signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
     try:
