@@ -24,11 +24,14 @@ initial_knowledge_data = [
     {"content": "本公司的營業時間是週一至週五，早上九點到下午六點。"},
     {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
     {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
-    # ... 您可以加入更多自訂資料
+    # 【修正 1】將考成分數等特定知識移至此處，由 initialize_knowledge_base 統一管理
+    {"content": "114年工作考成分數(立法院提刪通過)為 6.91  分。"}, 
+    {"content": "114年工作考成分數(立法院提刪未通過)為 6.04 分。"}, 
+    {"content": "114年工作考成分數(含不可抗力因素)為 6.46 分。"},
 ]
 
-# 【新增】RAG 信心門檻：歐幾里得距離小於此值，視為高相關度
-RAG_CONFIDENCE_THRESHOLD = 1.0 
+# RAG 信心門檻：從 1.0 降至 0.5，確保只有極高相似度才被視為高相關度 (原 0.4)
+RAG_CONFIDENCE_THRESHOLD = 0.5 
 # =============================================================
 
 
@@ -90,15 +93,12 @@ def get_embedding(text):
     if not client:
         return None
     try:
-        # 【修正 1: 將 'content' 改為 'contents'，並將 text 放入列表中】
-        # 【修正 3: 移除 'task_type' 參數，解決 API 呼叫錯誤】
         result = client.models.embed_content(
             model='text-embedding-004',
             contents=[text], # 這裡需要傳遞一個包含文本的列表
-            # 移除了 task_type='RETRIEVAL_DOCUMENT'
         )
-        # 【修正 4: 將字典索引 ['embedding'] 改為物件屬性 .embeddings[0]】
-        return result.embeddings[0]
+        # 確保取出列表形式的數值
+        return result.embeddings[0].values
     except Exception as e:
         print(f"[Embedding Error] 無法生成向量: {e}")
         return None
@@ -137,6 +137,7 @@ def initialize_knowledge_base():
 def add_new_knowledge(content):
     """
     將新的內容添加到知識庫資料庫，並自動生成向量。
+    注意：此函數不會檢查重複。
     """
     if not client:
         print("無法新增知識：Gemini 客戶端未初始化。")
@@ -149,7 +150,6 @@ def add_new_knowledge(content):
         cursor = conn.cursor()
         embedding_json = json.dumps(embedding)
         
-        # 這裡直接插入新資料，您也可以加入邏輯檢查內容是否重複
         try:
             cursor.execute(
                 "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
@@ -177,14 +177,13 @@ def query_knowledge_base(query_text, top_k=3):
     results = []
     
     conn = get_db_connection()
-    # 【修正：增加 try/except 處理資料庫查詢錯誤】
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT content, embedding_json FROM knowledge_base")
         rows = cursor.fetchall()
     except Exception as e:
-        print(f"[DB Query Error] 無法查詢知識庫: {e}")
-        # 如果資料庫查詢失敗，返回空結果，應用程式不會崩潰
+        # 捕獲 'no such table' 錯誤，並返回空結果，讓上層邏輯決定是啟用 Google Search 或返回錯誤
+        print(f"[DB Query Error] 無法查詢知識庫: {e}") 
         return "", False 
     finally:
         conn.close()
@@ -206,7 +205,7 @@ def query_knowledge_base(query_text, top_k=3):
     # 依距離排序 (距離小的排前面)
     results.sort(key=lambda x: x[0])
 
-    # 【新增邏輯】檢查最佳匹配的距離是否低於信心門檻
+    # 【邏輯】檢查最佳匹配的距離是否低於修正後的信心門檻
     if results and results[0][0] < RAG_CONFIDENCE_THRESHOLD:
         is_high_confidence = True
 
@@ -226,9 +225,8 @@ def GEMINI_response(user_text):
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
 
-    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
-    # 【修正】現在接收兩個值：rag_context 和 is_high_confidence 標記
-    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=3)
+    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文 (top_k 從 3 增加到 5)
+    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=5)
     
     # 2. 組合提示詞 (Prompt Augmentation)
     tools_config = [] # 預設不啟用 Google Search
@@ -237,20 +235,22 @@ def GEMINI_response(user_text):
         print(f"[RAG] 檢索到上下文:\n{rag_context[:50]}...")
         
         if is_high_confidence:
-            # 【高相關度邏輯】強制模型優先使用 RAG 內容，並關閉 Google Search
+            # 【高相關度邏輯】
             print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容並禁用 Google Search。")
             system_instruction = (
-                "你是一位專業的客服助理。你必須且只能根據提供的「CONTEXT」來回答問題，不得使用外部資訊。 "
-                "如果 CONTEXT 無法回答問題，請明確告知使用者資訊不足。 "
+                "你是一位企業內部客服助理。你必須且只能根據下列 CONTEXT 來回答使用者的問題。 "
+                "請將 CONTEXT 中的資訊直接轉換為自然語言回答。 "
+                "如果 CONTEXT 無法回答問題，請簡潔地回答：「很抱歉，在我的知識庫中沒有找到相關資訊。」\n\n"
                 f"CONTEXT:\n---\n{rag_context}\n---"
             )
             tools_config = [] # 移除 Google Search
         else:
-            # 【一般相關度邏輯】可以結合 Google Search
+            # 【低相關度邏輯】
             tools_config = [{"google_search": {}}] # 啟用 Google Search
             system_instruction = (
-                "你是一位專業的客服助理。你的首要任務是根據使用者提問和提供的「CONTEXT」來回答問題。 "
-                "如果 CONTEXT 包含相關資訊，請使用它。如果 CONTEXT 不相關或無法回答，則使用你的通用知識 (Google Search) 回答。 "
+                "你是一位樂於助人的助理。請根據使用者的問題回答。 "
+                "**優先**使用 Google Search 獲取最新資訊，並同時參考提供的 CONTEXT。 "
+                "如果 CONTEXT 相關，請結合；如果 CONTEXT 不相關，請忽略並僅使用 Google Search 的資訊來回答。\n\n"
                 f"CONTEXT:\n---\n{rag_context}\n---"
             )
         final_prompt = user_text
@@ -316,6 +316,10 @@ def GEMINI_response(user_text):
 # ========= LINE Webhook =========
 @app.route("/callback", methods=['POST'])
 def callback():
+    # 【關鍵修正】確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
+    setup_db()
+    initialize_knowledge_base()
+    
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
     app.logger.info(f"Request body: {body}")
@@ -325,6 +329,22 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return "OK"
+
+# 【新增】重新引入 /resetdb 端點，用於手動清除和重建資料庫
+@app.route("/resetdb")
+def reset_db():
+    """手動清除知識庫資料庫並重建。"""
+    try:
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            print(f"舊的資料庫 {DB_FILE} 已移除。")
+        
+        setup_db()
+        initialize_knowledge_base()
+        return "✅ 資料庫已重建並重新初始化完成。"
+    except Exception as e:
+        return f"❌ 資料庫重設失敗: {e}"
+
 
 # ========= 處理文字訊息 =========
 @handler.add(MessageEvent, message=TextMessage)
@@ -367,16 +387,9 @@ def welcome_new_member(event):
 
 # ========= 啟動 Flask =========
 if __name__ == "__main__":
-    # 【新增】應用程式啟動時先設定資料庫
+    # 應用程式啟動時先設定資料庫並初始化
     setup_db()
-    # 【修正】在資料庫設定完成後，再初始化知識庫 (寫入初始資料)
     initialize_knowledge_base() 
-    
-    # 【範例：寫入您的新知識】
-    # 1. 寫入具體的考成分數資訊
-    add_new_knowledge("工作考成分數為 6.5 分。")
-    # 2. 寫入另一個範例，例如：誰負責考評
-    add_new_knowledge("績效考評由部門主管負責，每年進行兩次。")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port)
