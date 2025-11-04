@@ -24,10 +24,12 @@ initial_knowledge_data = [
     {"content": "本公司的營業時間是週一至週五，早上九點到下午六點。"},
     {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
     {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
-    # ... 您可以加入更多自訂資料
+    # 【修正 1】將考成分數等特定知識移至此處，由 initialize_knowledge_base 統一管理
+    {"content": "工作考成分數為 6.5 分。"}, 
+    {"content": "績效考評由部門主管負責，每年進行兩次。"}, 
 ]
 
-# 【修正 1】RAG 信心門檻：從 1.0 降至 0.4，確保只有極高相似度才被視為高相關度
+# RAG 信心門檻：從 1.0 降至 0.4，確保只有極高相似度才被視為高相關度
 RAG_CONFIDENCE_THRESHOLD = 0.4 
 # =============================================================
 
@@ -134,6 +136,7 @@ def initialize_knowledge_base():
 def add_new_knowledge(content):
     """
     將新的內容添加到知識庫資料庫，並自動生成向量。
+    注意：此函數不會檢查重複。
     """
     if not client:
         print("無法新增知識：Gemini 客戶端未初始化。")
@@ -146,7 +149,6 @@ def add_new_knowledge(content):
         cursor = conn.cursor()
         embedding_json = json.dumps(embedding)
         
-        # 這裡直接插入新資料，您也可以加入邏輯檢查內容是否重複
         try:
             cursor.execute(
                 "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
@@ -179,7 +181,8 @@ def query_knowledge_base(query_text, top_k=3):
         cursor.execute("SELECT content, embedding_json FROM knowledge_base")
         rows = cursor.fetchall()
     except Exception as e:
-        print(f"[DB Query Error] 無法查詢知識庫: {e}")
+        # 捕獲 'no such table' 錯誤，並返回空結果，讓上層邏輯決定是啟用 Google Search 或返回錯誤
+        print(f"[DB Query Error] 無法查詢知識庫: {e}") 
         return "", False 
     finally:
         conn.close()
@@ -231,7 +234,7 @@ def GEMINI_response(user_text):
         print(f"[RAG] 檢索到上下文:\n{rag_context[:50]}...")
         
         if is_high_confidence:
-            # 【修正 2-A】高相關度邏輯：更明確地要求使用 RAG 內容
+            # 【高相關度邏輯】
             print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容並禁用 Google Search。")
             system_instruction = (
                 "你是一位企業內部客服助理。你必須且只能根據下列 CONTEXT 來回答使用者的問題。 "
@@ -241,7 +244,7 @@ def GEMINI_response(user_text):
             )
             tools_config = [] # 移除 Google Search
         else:
-            # 【修正 2-B】低相關度邏輯：強調優先使用 Google Search
+            # 【低相關度邏輯】
             tools_config = [{"google_search": {}}] # 啟用 Google Search
             system_instruction = (
                 "你是一位樂於助人的助理。請根據使用者的問題回答。 "
@@ -264,7 +267,7 @@ def GEMINI_response(user_text):
         try:
             config = types.GenerateContentConfig(
                 temperature=0.5, 
-                max_output_tokens=500,
+                max_output_tokens=1500,
                 # 【修正】動態設定 tools
                 tools=tools_config,
                 # 傳入系統指令
@@ -312,6 +315,10 @@ def GEMINI_response(user_text):
 # ========= LINE Webhook =========
 @app.route("/callback", methods=['POST'])
 def callback():
+    # 【關鍵修正】確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
+    setup_db()
+    initialize_knowledge_base()
+    
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
     app.logger.info(f"Request body: {body}")
@@ -321,6 +328,22 @@ def callback():
     except InvalidSignatureError:
         abort(400)
     return "OK"
+
+# 【新增】重新引入 /resetdb 端點，用於手動清除和重建資料庫
+@app.route("/resetdb")
+def reset_db():
+    """手動清除知識庫資料庫並重建。"""
+    try:
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            print(f"舊的資料庫 {DB_FILE} 已移除。")
+        
+        setup_db()
+        initialize_knowledge_base()
+        return "✅ 資料庫已重建並重新初始化完成。"
+    except Exception as e:
+        return f"❌ 資料庫重設失敗: {e}"
+
 
 # ========= 處理文字訊息 =========
 @handler.add(MessageEvent, message=TextMessage)
@@ -363,16 +386,9 @@ def welcome_new_member(event):
 
 # ========= 啟動 Flask =========
 if __name__ == "__main__":
-    # 【新增】應用程式啟動時先設定資料庫
+    # 應用程式啟動時先設定資料庫並初始化
     setup_db()
-    # 【修正】在資料庫設定完成後，再初始化知識庫 (寫入初始資料)
     initialize_knowledge_base() 
-    
-    # 【範例：寫入您的新知識】
-    # 1. 寫入具體的考成分數資訊
-    add_new_knowledge("工作考成分數為 6.5 分。")
-    # 2. 寫入另一個範例，例如：誰負責考評
-    add_new_knowledge("績效考評由部門主管負責，每年進行兩次。")
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port)
