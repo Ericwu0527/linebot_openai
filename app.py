@@ -352,9 +352,25 @@ def handle_text_message(event):
     user_msg = event.message.text
     print(f"[User Message]: {user_msg}")
 
-    # 改為呼叫 Gemini 回覆函數
-    reply_text = GEMINI_response(user_msg)
-    print(f"[Gemini Reply]: {reply_text}")
+    # 1. 檢查是否為新增知識的指令
+    ADD_COMMAND = "/新增知識:"
+    if user_msg.startswith(ADD_COMMAND):
+        knowledge_content = user_msg[len(ADD_COMMAND):].strip()
+        
+        if knowledge_content:
+            try:
+                # 呼叫新增知識的函數
+                add_new_knowledge(knowledge_content)
+                reply_text = f"✅ 成功將知識新增至資料庫：\n「{knowledge_content}」\n\n新的知識將立即用於問答檢索。"
+            except Exception as e:
+                reply_text = f"❌ 新增知識失敗：{e}"
+        else:
+            reply_text = f"請在指令後提供要新增的知識內容。格式：{ADD_COMMAND} [您的知識]"
+    else:
+        # 2. 正常的問答流程
+        # 改為呼叫 Gemini 回覆函數
+        reply_text = GEMINI_response(user_msg)
+        print(f"[Gemini Reply]: {reply_text}")
 
     line_bot_api.reply_message(
         event.reply_token,
