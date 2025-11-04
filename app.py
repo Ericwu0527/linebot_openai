@@ -174,6 +174,40 @@ def add_new_knowledge(content):
         conn.close()
 
 
+def delete_knowledge(content):
+    """
+    【新增函數】從知識庫資料庫中刪除完全匹配內容的記錄。
+    返回 (bool: 成功狀態, str: 訊息)。
+    """
+    if not content:
+        return False, "內容不能為空。"
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # 使用 content 作為 WHERE 條件進行刪除
+        cursor.execute(
+            "DELETE FROM knowledge_base WHERE content = ?",
+            (content,)
+        )
+        deleted_rows = cursor.rowcount
+        conn.commit()
+        
+        if deleted_rows > 0:
+            print(f"[Success] 成功從資料庫刪除 {deleted_rows} 條知識: {content[:30]}...")
+            return True, f"成功從資料庫刪除 {deleted_rows} 條匹配的知識：\n「{content}」"
+        else:
+            print(f"[Info] 資料庫中找不到匹配的知識: {content[:30]}...")
+            return False, f"找不到完全匹配的知識內容：\n「{content}」，請確認輸入內容是否與新增時完全一致。"
+            
+    except Exception as e:
+        print(f"[Error] 刪除知識失敗: {e}")
+        return False, f"資料庫刪除操作失敗: {e}"
+    finally:
+        conn.close()
+
+
 def query_knowledge_base(query_text, top_k=5):
     """
     從 SQLite 資料庫中檢索與查詢最相關的文檔。
@@ -241,21 +275,21 @@ def GEMINI_response(user_text):
     tools_config = [] # 預設不啟用 Google Search
 
     if rag_context:
-        print(f"[RAG] 檢索到上下文:\n{rag_context[:50]}...")
+        # 【修正邏輯】無論 RAG 信心度高低，都啟用 Google Search，但透過 System Instruction 指導模型優先處理內部知識。
+        tools_config = [{"google_search": {}}]
         
         if is_high_confidence:
-            # 【高相關度邏輯】優先使用 RAG 內容並禁用 Google Search
-            print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容並禁用 Google Search。")
+            # 高相關度：嚴格要求優先使用 RAG 知識回答業務問題，同時允許通用/計算問題使用 Google Search
+            print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容，但同時允許 Google Search 處理非業務問題。")
             system_instruction = (
-                "你是一位企業內部客服助理。你必須且只能根據下列 CONTEXT 來回答使用者的問題。 "
+                "你是一位企業內部客服助理。請**優先且嚴格**根據下列 CONTEXT 來回答**與內部業務相關**的問題。 "
                 "請將 CONTEXT 中的資訊直接轉換為自然語言回答。 "
-                "如果 CONTEXT 無法回答問題，請簡潔地回答：「很抱歉，在我的知識庫中沒有找到相關資訊。」\n\n"
+                "**如果問題明顯是外部知識、數學計算或通用查詢，則請忽略 CONTEXT 的限制，使用 Google Search 或你的通用知識來回答。** "
+                "如果 CONTEXT 相關但不足以回答，則可結合 Google Search。 "
                 f"CONTEXT:\n---\n{rag_context}\n---"
             )
-            tools_config = [] 
         else:
-            # 【低相關度邏輯】同時啟用 Google Search
-            tools_config = [{"google_search": {}}]
+            # 低相關度：使用通用策略 (結合 Google Search)
             system_instruction = (
                 "你是一位樂於助人的助理。請根據使用者的問題回答。 "
                 "**優先**使用 Google Search 獲取最新資訊，並同時參考提供的 CONTEXT。 "
@@ -264,7 +298,7 @@ def GEMINI_response(user_text):
             )
         final_prompt = user_text
     else:
-        # 沒有檢索到任何自訂資料，使用 Google Search
+        # 沒有檢索到任何自訂資料，只使用 Google Search
         tools_config = [{"google_search": {}}]
         system_instruction = "你是一位樂於助人的助理，請使用最新資訊來回答問題。"
         final_prompt = user_text
@@ -323,11 +357,6 @@ def GEMINI_response(user_text):
             return "⚠️ 發生未知錯誤，請稍後再試。"
 
 # ========= LINE Webhook =========
-
-@app.route('/')
-def index():
-    return "✅ LINE Bot Flask App is running on Render!"
-
 @app.route("/callback", methods=['POST'])
 def callback():
     # 確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
@@ -366,33 +395,57 @@ def handle_text_message(event):
     user_msg = event.message.text
     print(f"[User Message]: {user_msg}")
 
-    # 1. 檢查是否為新增知識的指令
-    ADD_COMMAND = "/新增知識:"
-    if user_msg.startswith(ADD_COMMAND):
-        knowledge_content = user_msg[len(ADD_COMMAND):].strip()
-        
-        if knowledge_content:
-            # 【重要修正】呼叫新增知識的函數並接收結果 (成功狀態和訊息)
-            success, message = add_new_knowledge(knowledge_content)
-            
-            if success:
-                reply_text = f"✅ {message}"
-            else:
-                # 失敗時，回覆詳細的錯誤訊息
-                reply_text = f"❌ 新增知識失敗：{message}"
+    ADD_COMMAND_PREFIXES = ["/新增知識:", "/新增知識："]
+    DELETE_COMMAND_PREFIXES = ["/刪除知識:", "/刪除知識："] # 使用戶在不知道內部選取標籤時也能使用
+    
+    command_found = False
+    reply_text = ""
 
-        else:
-            reply_text = f"請在指令後提供要新增的知識內容。格式：{ADD_COMMAND} [您的知識]"
+    # 1. 檢查並處理 ADD command
+    for prefix in ADD_COMMAND_PREFIXES:
+        if user_msg.startswith(prefix):
+            knowledge_content = user_msg[len(prefix):].strip()
+            command_found = True
+            if knowledge_content:
+                success, message = add_new_knowledge(knowledge_content)
+                reply_text = f"✅ {message}" if success else f"❌ 新增知識失敗：{message}"
+            else:
+                reply_text = f"請在指令後提供要新增的知識內容。格式範例：/新增知識: [您的知識]"
+            break
+
+    # 2. 檢查並處理 DELETE command (僅在 ADD command 未匹配時執行)
+    if not command_found:
+        # 為了相容性，同時檢查帶有  的版本 (若使用者複製貼上)
+        all_delete_prefixes = DELETE_COMMAND_PREFIXES + ["/刪除知識:", "/刪除知識："]
+        
+        for prefix in all_delete_prefixes:
+            if user_msg.startswith(prefix):
+                knowledge_to_delete = user_msg[len(prefix):].strip()
+                command_found = True
+                if knowledge_to_delete:
+                    # 呼叫新增的刪除函數
+                    success, message = delete_knowledge(knowledge_to_delete) 
+                    # 增加刪除成功的視覺提示 (垃圾桶圖案)
+                    reply_text = f"🗑️ {message}" if success else f"❌ 刪除知識失敗：{message}" 
+                else:
+                    reply_text = f"請在指令後提供**要刪除的完整知識內容**。格式範例：/刪除知識: [您的知識]"
+                break
+
+    if command_found:
+        # 如果找到並處理了任何命令 (新增或刪除)，則回覆結果
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
     else:
-        # 2. 正常的問答流程
-        # 改為呼叫 Gemini 回覆函數
+        # 3. 正常的問答流程
         reply_text = GEMINI_response(user_msg)
         print(f"[Gemini Reply]: {reply_text}")
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
 
 # ========= 處理 Postback (維持原樣) =========
 @handler.add(PostbackEvent)
