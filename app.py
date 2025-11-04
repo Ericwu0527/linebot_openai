@@ -264,7 +264,7 @@ def GEMINI_response(user_text):
         try:
             config = types.GenerateContentConfig(
                 temperature=0.5, 
-                max_output_tokens=1500,
+                max_output_tokens=500,
                 # 【修正】動態設定 tools
                 tools=tools_config,
                 # 傳入系統指令
