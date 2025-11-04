@@ -25,12 +25,12 @@ initial_knowledge_data = [
     {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
     {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
     # 【修正 1】將考成分數等特定知識移至此處，由 initialize_knowledge_base 統一管理
-    {"content": "114年工作考成分數(立法院提刪通過)為 6.91  分。"}, 
-    {"content": "114年工作考成分數(立法院提刪未通過)為 6.04 分。"}, 
-    {"content": "114年工作考成分數(含不可抗力因素)為 6.46 分。"},
+    {"content": "工作考成分數為 6.5 分。"}, 
+    {"content": "績效考評由部門主管負責，每年進行兩次。"}, 
 ]
 
 # RAG 信心門檻：從 1.0 降至 0.5，確保只有極高相似度才被視為高相關度 (原 0.4)
+# 備註：使用餘弦距離 (Cosine Distance)，距離 0.5 表示相似度為 0.5
 RAG_CONFIDENCE_THRESHOLD = 0.5 
 # =============================================================
 
@@ -81,11 +81,20 @@ def setup_db():
         print(f"SQLite 資料庫設定失敗: {e}")
 
 
-def euclidean_distance(vec1, vec2):
-    """計算兩個向量之間的歐幾里得距離 (距離越小，相似度越高)。"""
-    if len(vec1) != len(vec2):
-        return float('inf')
-    return math.sqrt(sum((v1 - v2) ** 2 for v1, v2 in zip(vec1, vec2)))
+def cosine_distance(vec1, vec2):
+    """計算兩個向量之間的餘弦距離 (1 - 餘弦相似度) (距離越小，相似度越高)。"""
+    dot_product = sum(v1 * v2 for v1, v2 in zip(vec1, vec2))
+    magnitude_v1 = math.sqrt(sum(v1 * v1 for v1 in vec1))
+    magnitude_v2 = math.sqrt(sum(v2 * v2 for v2 in vec2))
+
+    if magnitude_v1 == 0 or magnitude_v2 == 0:
+        return 1.0 # 向量為零，視為不相似 (距離最大)
+
+    cosine_similarity = dot_product / (magnitude_v1 * magnitude_v2)
+    # 餘弦相似度的範圍是 [-1, 1]。餘弦距離的範圍是 [0, 2]。
+    # 距離越小 (接近 0)，相似度越高 (接近 1)。
+    # 由於 text-embedding-004 的向量已經是標準化的，餘弦距離計算通常在 0 到 1 之間。
+    return 1.0 - cosine_similarity
 
 
 def get_embedding(text):
@@ -198,8 +207,8 @@ def query_knowledge_base(query_text, top_k=3):
             # 從 JSON 字符串還原為 Python 列表/向量
             item_embedding = json.loads(embedding_json)
             
-            # 計算相似度
-            distance = euclidean_distance(query_embedding, item_embedding)
+            # 【重要變更】計算餘弦距離
+            distance = cosine_distance(query_embedding, item_embedding)
             results.append((distance, content))
 
     # 依距離排序 (距離小的排前面)
