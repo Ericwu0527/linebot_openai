@@ -24,14 +24,13 @@ initial_knowledge_data = [
     {"content": "本公司的營業時間是週一至週五，早上九點到下午六點。"},
     {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
     {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
-    # 【修正 1】將考成分數等特定知識移至此處，由 initialize_knowledge_base 統一管理
-    {"content": "114年工作考成分數(立法院提刪通過)為 6.91  分。"}, 
+    # 將考成分數等特定知識移至此處，由 initialize_knowledge_base 統一管理
+    {"content": "114年工作考成分數(立法院提刪通過)為 6.91 分。"}, 
     {"content": "114年工作考成分數(立法院提刪未通過)為 6.04 分。"}, 
     {"content": "114年工作考成分數(含不可抗力因素)為 6.46 分。"},
 ]
 
-# RAG 信心門檻：從 1.0 降至 0.5，確保只有極高相似度才被視為高相關度 (原 0.4)
-# 備註：使用餘弦距離 (Cosine Distance)，距離 0.5 表示相似度為 0.5
+# RAG 信心門檻：使用餘弦距離 (Cosine Distance)，距離 0.5 表示相似度為 0.5
 RAG_CONFIDENCE_THRESHOLD = 0.5 
 # =============================================================
 
@@ -92,9 +91,6 @@ def cosine_distance(vec1, vec2):
         return 1.0 # 向量為零，視為不相似 (距離最大)
 
     cosine_similarity = dot_product / (magnitude_v1 * magnitude_v2)
-    # 餘弦相似度的範圍是 [-1, 1]。餘弦距離的範圍是 [0, 2]。
-    # 距離越小 (接近 0)，相似度越高 (接近 1)。
-    # 由於 text-embedding-004 的向量已經是標準化的，餘弦距離計算通常在 0 到 1 之間。
     return 1.0 - cosine_similarity
 
 
@@ -110,6 +106,7 @@ def get_embedding(text):
         # 確保取出列表形式的數值
         return result.embeddings[0].values
     except Exception as e:
+        # 在伺服器端印出詳細錯誤
         print(f"[Embedding Error] 無法生成向量: {e}")
         return None
 
@@ -147,35 +144,37 @@ def initialize_knowledge_base():
 def add_new_knowledge(content):
     """
     將新的內容添加到知識庫資料庫，並自動生成向量。
-    注意：此函數不會檢查重複。
+    返回 (bool: 成功狀態, str: 訊息)。
     """
     if not client:
-        print("無法新增知識：Gemini 客戶端未初始化。")
-        return
+        return False, "Gemini API 客戶端未初始化，無法生成向量。"
         
     embedding = get_embedding(content)
     
-    if embedding:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        embedding_json = json.dumps(embedding)
-        
-        try:
-            cursor.execute(
-                "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
-                (content, embedding_json)
-            )
-            conn.commit()
-            print(f"[Success] 成功新增知識到資料庫: {content[:30]}...")
-        except Exception as e:
-            print(f"[Error] 新增知識失敗: {e}")
-        finally:
-            conn.close()
-    else:
-        print(f"[Error] 無法為內容生成 Embedding: {content[:30]}...")
+    if not embedding:
+        # 當 get_embedding 失敗時 (通常是 API 錯誤或逾時)
+        return False, "無法呼叫 Gemini API 生成知識的向量 (Embedding)，請檢查 API Key 或重試。"
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    embedding_json = json.dumps(embedding)
+    
+    try:
+        cursor.execute(
+            "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
+            (content, embedding_json)
+        )
+        conn.commit()
+        print(f"[Success] 成功新增知識到資料庫: {content[:30]}...")
+        return True, f"成功將知識新增至資料庫：\n「{content}」\n\n新的知識將立即用於問答檢索。"
+    except Exception as e:
+        print(f"[Error] 新增知識失敗: {e}")
+        return False, f"資料庫寫入失敗: {e}"
+    finally:
+        conn.close()
 
 
-def query_knowledge_base(query_text, top_k=3):
+def query_knowledge_base(query_text, top_k=5):
     """
     從 SQLite 資料庫中檢索與查詢最相關的文檔。
     """
@@ -192,7 +191,7 @@ def query_knowledge_base(query_text, top_k=3):
         cursor.execute("SELECT content, embedding_json FROM knowledge_base")
         rows = cursor.fetchall()
     except Exception as e:
-        # 捕獲 'no such table' 錯誤，並返回空結果，讓上層邏輯決定是啟用 Google Search 或返回錯誤
+        # 捕獲 'no such table' 錯誤
         print(f"[DB Query Error] 無法查詢知識庫: {e}") 
         return "", False 
     finally:
@@ -208,14 +207,14 @@ def query_knowledge_base(query_text, top_k=3):
             # 從 JSON 字符串還原為 Python 列表/向量
             item_embedding = json.loads(embedding_json)
             
-            # 【重要變更】計算餘弦距離
+            # 計算餘弦距離
             distance = cosine_distance(query_embedding, item_embedding)
             results.append((distance, content))
 
     # 依距離排序 (距離小的排前面)
     results.sort(key=lambda x: x[0])
 
-    # 【邏輯】檢查最佳匹配的距離是否低於修正後的信心門檻
+    # 檢查最佳匹配的距離是否低於信心門檻
     if results and results[0][0] < RAG_CONFIDENCE_THRESHOLD:
         is_high_confidence = True
 
@@ -235,7 +234,7 @@ def GEMINI_response(user_text):
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
 
-    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文 (top_k 從 3 增加到 5)
+    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
     rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=5)
     
     # 2. 組合提示詞 (Prompt Augmentation)
@@ -245,7 +244,7 @@ def GEMINI_response(user_text):
         print(f"[RAG] 檢索到上下文:\n{rag_context[:50]}...")
         
         if is_high_confidence:
-            # 【高相關度邏輯】
+            # 【高相關度邏輯】優先使用 RAG 內容並禁用 Google Search
             print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容並禁用 Google Search。")
             system_instruction = (
                 "你是一位企業內部客服助理。你必須且只能根據下列 CONTEXT 來回答使用者的問題。 "
@@ -253,10 +252,10 @@ def GEMINI_response(user_text):
                 "如果 CONTEXT 無法回答問題，請簡潔地回答：「很抱歉，在我的知識庫中沒有找到相關資訊。」\n\n"
                 f"CONTEXT:\n---\n{rag_context}\n---"
             )
-            tools_config = [] # 移除 Google Search
+            tools_config = [] 
         else:
-            # 【低相關度邏輯】
-            tools_config = [{"google_search": {}}] # 啟用 Google Search
+            # 【低相關度邏輯】同時啟用 Google Search
+            tools_config = [{"google_search": {}}]
             system_instruction = (
                 "你是一位樂於助人的助理。請根據使用者的問題回答。 "
                 "**優先**使用 Google Search 獲取最新資訊，並同時參考提供的 CONTEXT。 "
@@ -279,7 +278,7 @@ def GEMINI_response(user_text):
             config = types.GenerateContentConfig(
                 temperature=0.5, 
                 max_output_tokens=1500,
-                # 【修正】動態設定 tools
+                # 動態設定 tools
                 tools=tools_config,
                 # 傳入系統指令
                 system_instruction=system_instruction, 
@@ -292,7 +291,7 @@ def GEMINI_response(user_text):
                 config=config,
             )
 
-            # 【內容檢查】
+            # 內容檢查
             if not response.text:
                 error_detail = "API 回應中無文字內容。"
                 if response.candidates:
@@ -326,7 +325,7 @@ def GEMINI_response(user_text):
 # ========= LINE Webhook =========
 @app.route("/callback", methods=['POST'])
 def callback():
-    # 【關鍵修正】確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
+    # 確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
     setup_db()
     initialize_knowledge_base()
     
@@ -340,7 +339,7 @@ def callback():
         abort(400)
     return "OK"
 
-# 【新增】重新引入 /resetdb 端點，用於手動清除和重建資料庫
+# 重新引入 /resetdb 端點，用於手動清除和重建資料庫
 @app.route("/resetdb")
 def reset_db():
     """手動清除知識庫資料庫並重建。"""
@@ -368,12 +367,15 @@ def handle_text_message(event):
         knowledge_content = user_msg[len(ADD_COMMAND):].strip()
         
         if knowledge_content:
-            try:
-                # 呼叫新增知識的函數
-                add_new_knowledge(knowledge_content)
-                reply_text = f"✅ 成功將知識新增至資料庫：\n「{knowledge_content}」\n\n新的知識將立即用於問答檢索。"
-            except Exception as e:
-                reply_text = f"❌ 新增知識失敗：{e}"
+            # 【重要修正】呼叫新增知識的函數並接收結果 (成功狀態和訊息)
+            success, message = add_new_knowledge(knowledge_content)
+            
+            if success:
+                reply_text = f"✅ {message}"
+            else:
+                # 失敗時，回覆詳細的錯誤訊息
+                reply_text = f"❌ 新增知識失敗：{message}"
+
         else:
             reply_text = f"請在指令後提供要新增的知識內容。格式：{ADD_COMMAND} [您的知識]"
     else:
