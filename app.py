@@ -29,8 +29,8 @@ initial_knowledge_data = [
     {"content": "績效考評由部門主管負責，每年進行兩次。"}, 
 ]
 
-# RAG 信心門檻：從 1.0 降至 0.4，確保只有極高相似度才被視為高相關度
-RAG_CONFIDENCE_THRESHOLD = 0.4 
+# RAG 信心門檻：從 1.0 降至 0.5，確保只有極高相似度才被視為高相關度 (原 0.4)
+RAG_CONFIDENCE_THRESHOLD = 0.5 
 # =============================================================
 
 
@@ -224,8 +224,8 @@ def GEMINI_response(user_text):
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
 
-    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文
-    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=3)
+    # 1. RAG 檢索步驟：從您的知識庫中獲取相關上下文 (top_k 從 3 增加到 5)
+    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=5)
     
     # 2. 組合提示詞 (Prompt Augmentation)
     tools_config = [] # 預設不啟用 Google Search
