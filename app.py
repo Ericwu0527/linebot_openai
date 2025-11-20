@@ -357,6 +357,11 @@ def GEMINI_response(user_text):
             return "⚠️ 發生未知錯誤，請稍後再試。"
 
 # ========= LINE Webhook =========
+@app.route('/')
+def index():
+    return "✅ LINE Bot Flask App is running on Render!"
+
+
 @app.route("/callback", methods=['POST'])
 def callback():
     # 確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
