@@ -7,24 +7,25 @@ import os
 import time
 import traceback
 import math 
-import sqlite3 # 引入 SQLite 函式庫
-import json # 引入 json 函式庫用於序列化向量
+import json 
+
+# 【變更 1】引入 Firestore 函式庫
+from google.cloud import firestore
 
 # 引入 Google GenAI SDK
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-# ======================= RAG 知識庫設定 =======================
-# 【變更】使用 SQLite 檔案來持久化儲存資料
-DB_FILE = "knowledge_base.db" 
+# ======================= RAG 知識庫設定 (使用 Firestore) =======================
+# 設定 Firestore 集合名稱
+KNOWLEDGE_COLLECTION = "knowledge_base" 
 
 # 初始資料 (只在資料庫第一次建立時使用)
 initial_knowledge_data = [
     {"content": "本公司的營業時間是週一至週五，早上九點到下午六點。"},
-    {"content": "退貨政策：非特價商品可在購買後30天內憑發票退貨。"},
+    {"content": "退貨政策：非特價商品可在購買後30天內憑發票退票。"},
     {"content": "技術支援請發送電子郵件至 support@mycompany.com。"},
-    # 將考成分數等特定知識移至此處，由 initialize_knowledge_base 統一管理
     {"content": "114年工作考成分數(立法院提刪通過)為 6.91 分。"}, 
     {"content": "114年工作考成分數(立法院提刪未通過)為 6.04 分。"}, 
     {"content": "114年工作考成分數(含不可抗力因素)為 6.46 分。"},
@@ -54,31 +55,13 @@ except Exception as e:
     print(f"初始化 Gemini 客戶端失敗: {e}")
     client = None
 
-
-def get_db_connection():
-    """建立並返回 SQLite 資料庫連線。"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row # 讓資料以字典形式返回
-    return conn
-
-def setup_db():
-    """建立知識庫表格，如果它不存在。"""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        # 建立表格：content 儲存原始文本, embedding_json 儲存向量的 JSON 格式
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_base (
-                id INTEGER PRIMARY KEY,
-                content TEXT NOT NULL,
-                embedding_json TEXT
-            );
-        """)
-        conn.commit()
-        conn.close()
-        print("SQLite 資料庫設定完成。")
-    except Exception as e:
-        print(f"SQLite 資料庫設定失敗: {e}")
+# 初始化 Firestore 客戶端
+try:
+    db = firestore.Client()
+    print("Firestore 客戶端初始化成功。")
+except Exception as e:
+    print(f"初始化 Firestore 客戶端失敗: {e}")
+    db = None
 
 
 def cosine_distance(vec1, vec2):
@@ -88,7 +71,7 @@ def cosine_distance(vec1, vec2):
     magnitude_v2 = math.sqrt(sum(v2 * v2 for v2 in vec2))
 
     if magnitude_v1 == 0 or magnitude_v2 == 0:
-        return 1.0 # 向量為零，視為不相似 (距離最大)
+        return 1.0 
 
     cosine_similarity = dot_product / (magnitude_v1 * magnitude_v2)
     return 1.0 - cosine_similarity
@@ -101,149 +84,85 @@ def get_embedding(text):
     try:
         result = client.models.embed_content(
             model='text-embedding-004',
-            contents=[text], # 這裡需要傳遞一個包含文本的列表
+            contents=[text],
         )
-        # 確保取出列表形式的數值
         return result.embeddings[0].values
     except Exception as e:
-        # 在伺服器端印出詳細錯誤
         print(f"[Embedding Error] 無法生成向量: {e}")
         return None
 
 
 def initialize_knowledge_base():
-    """檢查資料庫，如果沒有資料則插入初始資料並生成向量。"""
-    if not client:
+    """檢查 Firestore 資料庫，如果沒有資料則插入初始資料並生成向量。"""
+    if not client or not db:
+        print("警告：LLM 或 Firestore 客戶端未初始化，跳過知識庫初始化。")
         return
     
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM knowledge_base")
-    count = cursor.fetchone()[0]
+    doc_count = 0
+    try:
+        docs = db.collection(KNOWLEDGE_COLLECTION).limit(1).stream() 
+        doc_count = sum(1 for _ in docs)
+    except Exception as e:
+        print(f"檢查 Firestore 集合失敗: {e}")
+        return
 
-    if count == 0:
-        print("正在初始化 RAG 知識庫 (生成 embeddings 並寫入資料庫)...")
+    if doc_count == 0:
+        print("正在初始化 RAG 知識庫 (生成 embeddings 並寫入 Firestore)...")
         for item in initial_knowledge_data:
             content = item['content']
-            # 生成向量
+            
             embedding = get_embedding(content)
             
             if embedding:
-                # 將向量轉換為 JSON 字符串以便儲存在 SQLite
-                embedding_json = json.dumps(embedding)
-                cursor.execute(
-                    "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
-                    (content, embedding_json)
-                )
-        conn.commit()
-        print("RAG 知識庫初始化完成，資料已儲存到 knowledge_base.db。")
-    
-    conn.close()
+                embedding_json = json.dumps(embedding) 
+                
+                try:
+                    db.collection(KNOWLEDGE_COLLECTION).add({
+                        'content': content,
+                        'embedding_json': embedding_json,
+                        'created_at': firestore.SERVER_TIMESTAMP 
+                    })
+                except Exception as e:
+                    print(f"寫入 Firestore 失敗: {e}")
+                    
+        print("RAG 知識庫初始化完成，資料已儲存到 Firestore。")
+    else:
+        print("RAG 知識庫已包含資料，跳過初始化。")
 
-
-def add_new_knowledge(content):
-    """
-    將新的內容添加到知識庫資料庫，並自動生成向量。
-    返回 (bool: 成功狀態, str: 訊息)。
-    """
-    if not client:
-        return False, "Gemini API 客戶端未初始化，無法生成向量。"
-        
-    embedding = get_embedding(content)
-    
-    if not embedding:
-        # 當 get_embedding 失敗時 (通常是 API 錯誤或逾時)
-        return False, "無法呼叫 Gemini API 生成知識的向量 (Embedding)，請檢查 API Key 或重試。"
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    embedding_json = json.dumps(embedding)
-    
-    try:
-        cursor.execute(
-            "INSERT INTO knowledge_base (content, embedding_json) VALUES (?, ?)",
-            (content, embedding_json)
-        )
-        conn.commit()
-        print(f"[Success] 成功新增知識到資料庫: {content[:30]}...")
-        return True, f"成功將知識新增至資料庫：\n「{content}」\n\n新的知識將立即用於問答檢索。"
-    except Exception as e:
-        print(f"[Error] 新增知識失敗: {e}")
-        return False, f"資料庫寫入失敗: {e}"
-    finally:
-        conn.close()
-
-
-def delete_knowledge(content):
-    """
-    【新增函數】從知識庫資料庫中刪除完全匹配內容的記錄。
-    返回 (bool: 成功狀態, str: 訊息)。
-    """
-    if not content:
-        return False, "內容不能為空。"
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # 使用 content 作為 WHERE 條件進行刪除
-        cursor.execute(
-            "DELETE FROM knowledge_base WHERE content = ?",
-            (content,)
-        )
-        deleted_rows = cursor.rowcount
-        conn.commit()
-        
-        if deleted_rows > 0:
-            print(f"[Success] 成功從資料庫刪除 {deleted_rows} 條知識: {content[:30]}...")
-            return True, f"成功從資料庫刪除 {deleted_rows} 條匹配的知識：\n「{content}」"
-        else:
-            print(f"[Info] 資料庫中找不到匹配的知識: {content[:30]}...")
-            return False, f"找不到完全匹配的知識內容：\n「{content}」，請確認輸入內容是否與新增時完全一致。"
-            
-    except Exception as e:
-        print(f"[Error] 刪除知識失敗: {e}")
-        return False, f"資料庫刪除操作失敗: {e}"
-    finally:
-        conn.close()
-
+# 【移除】add_new_knowledge 函式已被移除
+# 【移除】delete_knowledge 函式已被移除
 
 def query_knowledge_base(query_text, top_k=5):
-    """
-    從 SQLite 資料庫中檢索與查詢最相關的文檔。
-    """
+    """從 Firestore 資料庫中檢索與查詢最相關的文檔。"""
+    if not db:
+        return "", False
+
     query_embedding = get_embedding(query_text)
     if not query_embedding:
-        # 如果無法生成查詢向量，則無法進行 RAG 檢索
         return "", False
 
     results = []
-    
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT content, embedding_json FROM knowledge_base")
-        rows = cursor.fetchall()
-    except Exception as e:
-        # 捕獲 'no such table' 錯誤
-        print(f"[DB Query Error] 無法查詢知識庫: {e}") 
-        return "", False 
-    finally:
-        conn.close()
-
     is_high_confidence = False
 
-    for row in rows:
-        content = row['content']
-        embedding_json = row['embedding_json']
+    try:
+        # 從 Firestore 讀取所有文檔
+        docs = db.collection(KNOWLEDGE_COLLECTION).stream()
         
-        if embedding_json:
-            # 從 JSON 字符串還原為 Python 列表/向量
-            item_embedding = json.loads(embedding_json)
+        for doc in docs:
+            data = doc.to_dict()
+            content = data.get('content')
+            embedding_json = data.get('embedding_json')
             
-            # 計算餘弦距離
-            distance = cosine_distance(query_embedding, item_embedding)
-            results.append((distance, content))
+            if content and embedding_json:
+                item_embedding = json.loads(embedding_json)
+                
+                # 計算餘弦距離
+                distance = cosine_distance(query_embedding, item_embedding)
+                results.append((distance, content))
+
+    except Exception as e:
+        print(f"[Firestore Query Error] 無法查詢知識庫: {e}") 
+        return "", False 
 
     # 依距離排序 (距離小的排前面)
     results.sort(key=lambda x: x[0])
@@ -257,10 +176,9 @@ def query_knowledge_base(query_text, top_k=5):
     for distance, content in results[:top_k]:
         context.append(content)
 
-    return "\n".join(context), is_high_confidence # 增加返回高相關度標記
+    return "\n".join(context), is_high_confidence
 
 
-# Gemini 回覆函數
 def GEMINI_response(user_text):
     """
     呼叫 Google Gemini API，先進行 RAG 檢索，再將上下文與問題一起傳給模型。
@@ -272,14 +190,12 @@ def GEMINI_response(user_text):
     rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=5)
     
     # 2. 組合提示詞 (Prompt Augmentation)
-    tools_config = [] # 預設不啟用 Google Search
+    tools_config = [] 
 
     if rag_context:
-        # 【修正邏輯】無論 RAG 信心度高低，都啟用 Google Search，但透過 System Instruction 指導模型優先處理內部知識。
         tools_config = [{"google_search": {}}]
         
         if is_high_confidence:
-            # 高相關度：嚴格要求優先使用 RAG 知識回答業務問題，同時允許通用/計算問題使用 Google Search
             print("[RAG] 檢索到高相關度知識，將優先使用 RAG 內容，但同時允許 Google Search 處理非業務問題。")
             system_instruction = (
                 "你是一位企業內部客服助理。請**優先且嚴格**根據下列 CONTEXT 來回答**與內部業務相關**的問題。 "
@@ -289,7 +205,6 @@ def GEMINI_response(user_text):
                 f"CONTEXT:\n---\n{rag_context}\n---"
             )
         else:
-            # 低相關度：使用通用策略 (結合 Google Search)
             system_instruction = (
                 "你是一位樂於助人的助理。請根據使用者的問題回答。 "
                 "**優先**使用 Google Search 獲取最新資訊，並同時參考提供的 CONTEXT。 "
@@ -312,9 +227,7 @@ def GEMINI_response(user_text):
             config = types.GenerateContentConfig(
                 temperature=0.5, 
                 max_output_tokens=1500,
-                # 動態設定 tools
                 tools=tools_config,
-                # 傳入系統指令
                 system_instruction=system_instruction, 
             )
 
@@ -325,7 +238,6 @@ def GEMINI_response(user_text):
                 config=config,
             )
 
-            # 內容檢查
             if not response.text:
                 error_detail = "API 回應中無文字內容。"
                 if response.candidates:
@@ -334,8 +246,6 @@ def GEMINI_response(user_text):
                 print(f"[Gemini Error] Generation blocked or empty. Detail: {error_detail}")
                 return f"⚠️ 內容生成失敗：{error_detail}"
 
-
-            # 取出回答文字
             answer = response.text.strip()
 
             if len(answer) > 2000:
@@ -364,9 +274,7 @@ def index():
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    # 確保在處理任何 LINE 訊息前，資料庫表格已被設定且初始知識已載入。
-    setup_db()
-    initialize_knowledge_base()
+    initialize_knowledge_base() 
     
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
@@ -378,86 +286,55 @@ def callback():
         abort(400)
     return "OK"
 
-# 重新引入 /resetdb 端點，用於手動清除和重建資料庫
+
 @app.route("/resetdb")
 def reset_db():
-    """手動清除知識庫資料庫並重建。"""
+    """手動清除 Firestore 知識庫集合並重建初始資料。"""
+    if not db:
+        return "❌ Firestore 客戶端未初始化，無法執行重設。"
+    
     try:
-        if os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
-            print(f"舊的資料庫 {DB_FILE} 已移除。")
+        docs = db.collection(KNOWLEDGE_COLLECTION).list_documents()
+        deleted_count = 0
+        batch = db.batch()
+        for doc in docs:
+            batch.delete(doc)
+            deleted_count += 1
         
-        setup_db()
-        initialize_knowledge_base()
-        return "✅ 資料庫已重建並重新初始化完成。"
+        if deleted_count > 0:
+             batch.commit()
+             print(f"舊的知識庫集合 ({KNOWLEDGE_COLLECTION}) 中 {deleted_count} 筆資料已移除。")
+        else:
+             print("知識庫集合為空，無需刪除。")
+
+        initialize_knowledge_base() 
+        
+        return "✅ Firestore 資料庫已清除並重新初始化完成。"
     except Exception as e:
+        print(f"❌ Firestore 資料庫重設失敗: {e}")
         return f"❌ 資料庫重設失敗: {e}"
 
 
-# ========= 處理文字訊息 =========
+# ========= 處理文字訊息 【修改】只保留正常的問答流程 =========
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     user_msg = event.message.text
     print(f"[User Message]: {user_msg}")
 
-    ADD_COMMAND_PREFIXES = ["/新增知識:", "/新增知識："]
-    DELETE_COMMAND_PREFIXES = ["/刪除知識:", "/刪除知識："] # 使用戶在不知道內部選取標籤時也能使用
-    
-    command_found = False
-    reply_text = ""
+    # 3. 正常的問答流程
+    reply_text = GEMINI_response(user_msg)
+    print(f"[Gemini Reply]: {reply_text}")
 
-    # 1. 檢查並處理 ADD command
-    for prefix in ADD_COMMAND_PREFIXES:
-        if user_msg.startswith(prefix):
-            knowledge_content = user_msg[len(prefix):].strip()
-            command_found = True
-            if knowledge_content:
-                success, message = add_new_knowledge(knowledge_content)
-                reply_text = f"✅ {message}" if success else f"❌ 新增知識失敗：{message}"
-            else:
-                reply_text = f"請在指令後提供要新增的知識內容。格式範例：/新增知識: [您的知識]"
-            break
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
 
-    # 2. 檢查並處理 DELETE command (僅在 ADD command 未匹配時執行)
-    if not command_found:
-        # 為了相容性，同時檢查帶有  的版本 (若使用者複製貼上)
-        all_delete_prefixes = DELETE_COMMAND_PREFIXES + ["/刪除知識:", "/刪除知識："]
-        
-        for prefix in all_delete_prefixes:
-            if user_msg.startswith(prefix):
-                knowledge_to_delete = user_msg[len(prefix):].strip()
-                command_found = True
-                if knowledge_to_delete:
-                    # 呼叫新增的刪除函數
-                    success, message = delete_knowledge(knowledge_to_delete) 
-                    # 增加刪除成功的視覺提示 (垃圾桶圖案)
-                    reply_text = f"🗑️ {message}" if success else f"❌ 刪除知識失敗：{message}" 
-                else:
-                    reply_text = f"請在指令後提供**要刪除的完整知識內容**。格式範例：/刪除知識: [您的知識]"
-                break
-
-    if command_found:
-        # 如果找到並處理了任何命令 (新增或刪除)，則回覆結果
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_text)
-        )
-    else:
-        # 3. 正常的問答流程
-        reply_text = GEMINI_response(user_msg)
-        print(f"[Gemini Reply]: {reply_text}")
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_text)
-        )
-
-# ========= 處理 Postback (維持原樣) =========
+# Postback 和 MemberJoinedEvent 處理保持不變
 @handler.add(PostbackEvent)
 def handle_postback(event):
     print(f"[Postback Data]: {event.postback.data}")
 
-# ========= 處理加入群組事件 (微調歡迎訊息) =========
 @handler.add(MemberJoinedEvent)
 def welcome_new_member(event):
     try:
@@ -478,8 +355,6 @@ def welcome_new_member(event):
 
 # ========= 啟動 Flask =========
 if __name__ == "__main__":
-    # 應用程式啟動時先設定資料庫並初始化
-    setup_db()
     initialize_knowledge_base() 
     
     port = int(os.environ.get('PORT', 5000))
