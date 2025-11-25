@@ -3,3 +3,4 @@ flask
 google-genai
 gunicorn
 python-dotenv
+google-cloud-firestore
