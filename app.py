@@ -117,4 +117,337 @@ def initialize_knowledge_base():
             embedding = get_embedding(content)
             
             if embedding:
-                embedding_json = json.dumps(embedding)
+                embedding_json = json.dumps(embedding) 
+                
+                try:
+                    db.collection(KNOWLEDGE_COLLECTION).add({
+                        'content': content,
+                        'embedding_json': embedding_json,
+                        'created_at': firestore.SERVER_TIMESTAMP 
+                    })
+                except Exception as e:
+                    print(f"寫入 Firestore 失敗: {e}")
+                    
+        print("RAG 知識庫初始化完成，資料已儲存到 Firestore。")
+    else:
+        print("RAG 知識庫已包含資料，跳過初始化。")
+
+
+def query_knowledge_base(query_text, top_k=5):
+    """從 Firestore 資料庫中檢索與查詢最相關的文檔 (企業知識)。"""
+    if not db:
+        return "", False
+
+    query_embedding = get_embedding(query_text)
+    if not query_embedding:
+        return "", False
+
+    results = []
+    is_high_confidence = False
+
+    try:
+        # 從 Firestore 讀取所有文檔
+        docs = db.collection(KNOWLEDGE_COLLECTION).stream()
+        
+        for doc in docs:
+            data = doc.to_dict()
+            content = data.get('content')
+            embedding_json = data.get('embedding_json')
+            
+            if content and embedding_json:
+                item_embedding = json.loads(embedding_json)
+                
+                # 計算餘弦距離
+                distance = cosine_distance(query_embedding, item_embedding)
+                results.append((distance, content))
+
+    except Exception as e:
+        print(f"[Firestore Query Error] 無法查詢知識庫: {e}") 
+        return "", False 
+
+    # 依距離排序 (距離小的排前面)
+    results.sort(key=lambda x: x[0])
+
+    # 檢查最佳匹配的距離是否低於信心門檻
+    if results and results[0][0] < RAG_CONFIDENCE_THRESHOLD:
+        is_high_confidence = True
+
+    # 選擇前 top_k 個結果，並組成上下文
+    context = []
+    for distance, content in results[:top_k]:
+        context.append(content)
+
+    return "\n".join(context), is_high_confidence
+
+
+def record_reminder(user_id, raw_text):
+    """
+    新增函式：將用戶輸入的原始行程文字寫入 Firestore 的 'reminders' 集合。
+    """
+    if not db:
+        return False, "Firestore 客戶端未初始化，無法記錄。"
+    
+    try:
+        db.collection(REMINDER_COLLECTION).add({
+            'user_id': user_id, 
+            'raw_text': raw_text,
+            'recorded_at': firestore.SERVER_TIMESTAMP,
+            'is_completed': False,
+        })
+        
+        return True, f"✅ 已為您記下行程：\n「{raw_text}」"
+    except Exception as e:
+        print(f"[Firestore Record Error] 無法記錄行程: {e}")
+        return False, f"❌ 記錄行程失敗：{e}"
+
+
+def get_user_reminders(user_id):
+    """
+    新增函式：從 Firestore 的 'reminders' 集合中讀取特定用戶的所有未完成行程。
+    返回一個包含行程描述的字串列表。
+    """
+    if not db:
+        return []
+    
+    reminders_list = []
+    try:
+        # 查詢特定用戶且尚未完成的行程
+        docs = db.collection(REMINDER_COLLECTION)\
+                 .where('user_id', '==', user_id)\
+                 .where('is_completed', '==', False)\
+                 .order_by('recorded_at', direction=firestore.Query.DESCENDING)\
+                 .limit(10)\
+                 .stream()
+        
+        for i, doc in enumerate(docs):
+            data = doc.to_dict()
+            recorded_time = data.get('recorded_at')
+            
+            # 簡單格式化輸出日期時間，如果 recorded_at 是 Timestamp 對象
+            time_str = recorded_time.strftime('%m/%d %H:%M') if recorded_time else "未知時間"
+            
+            # 將行程內容和記錄時間打包成上下文
+            reminders_list.append(f"行程 {i+1}. 內容: {data['raw_text']} (記錄於: {time_str})")
+            
+    except Exception as e:
+        print(f"[Firestore Read Error] 無法讀取行程: {e}")
+        return []
+
+    return reminders_list
+
+
+def GEMINI_response(user_text, user_id):
+    """
+    呼叫 Google Gemini API，先進行 RAG 檢索 (企業知識 + 個人行程)，再將上下文與問題一起傳給模型。
+    """
+    if not client:
+        return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
+
+    # 1. 檢索企業知識庫
+    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=5)
+    
+    # 2. 讀取使用者個人行程
+    user_reminders = get_user_reminders(user_id)
+    personal_context = "\n".join(user_reminders)
+    
+    # 3. 組合提示詞 (Prompt Augmentation)
+    tools_config = []
+    full_context_parts = []
+
+    if rag_context:
+        full_context_parts.append(f"【企業知識】:\n{rag_context}")
+    if personal_context:
+        full_context_parts.append(f"【您的個人行程（未完成事項）】:\n{personal_context}")
+
+    full_context = "\n---\n".join(full_context_parts)
+
+    if full_context:
+        # 只要有任何上下文 (企業知識或個人行程)，就啟用 Google Search
+        tools_config = [{"google_search": {}}]
+        
+        system_instruction = (
+            "你是一位專業且樂於助人的助理。請根據提供的 CONTEXT 和你的通用知識來回答問題。 "
+            "你的回答必須遵循以下優先順序：\n"
+            "1. 如果問題關於**個人行程**（如：『我記了什麼？』），請優先使用 CONTEXT 中的【您的個人行程】資訊。\n"
+            "2. 如果問題關於**企業業務**（如：『營業時間？』），請優先使用 CONTEXT 中的【企業知識】資訊。\n"
+            "3. 如果問題是通用查詢或計算，請使用 Google Search 或你的通用知識。\n"
+            "如果 CONTEXT 相關但不完整，請結合 Google Search。\n\n"
+            f"所有可用的 CONTEXT:\n===\n{full_context}\n==="
+        )
+        final_prompt = user_text
+    else:
+        # 沒有任何上下文，只使用 Google Search
+        tools_config = [{"google_search": {}}]
+        system_instruction = "你是一位樂於助人的助理，請使用最新資訊來回答問題。"
+        final_prompt = user_text
+
+
+    max_retries = 3
+    delay = 2
+
+    for attempt in range(max_retries):
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.5, 
+                max_output_tokens=1500,
+                tools=tools_config,
+                system_instruction=system_instruction, 
+            )
+
+            # 呼叫 Gemini API
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=final_prompt,
+                config=config,
+            )
+
+            if not response.text:
+                error_detail = "API 回應中無文字內容。"
+                if response.candidates:
+                    finish_reason = response.candidates[0].finish_reason.name
+                    error_detail = f"模型完成原因: {finish_reason}。"
+                print(f"[Gemini Error] Generation blocked or empty. Detail: {error_detail}")
+                return f"⚠️ 內容生成失敗：{error_detail}"
+
+            answer = response.text.strip()
+
+            if len(answer) > 2000:
+                answer = answer[:2000] + "…（回覆過長，已截斷）"
+
+            return answer
+
+        except APIError as e:
+            print(f"[Gemini API Error] {e}")
+            if attempt < max_retries - 1:
+                print(f"等待 {delay} 秒後重試...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return "⚠️ 目前系統忙碌或 Gemini API 無法回應，請稍後再試。"
+
+        except Exception as e:
+            print(traceback.format_exc())
+            return "⚠️ 發生未知錯誤，請稍後再試。"
+
+# ========= LINE Webhook =========
+@app.route('/')
+def index():
+    return "✅ LINE Bot Flask App is running on Render!"
+
+
+@app.route("/callback", methods=['POST'])
+def callback():
+    initialize_knowledge_base() 
+    
+    signature = request.headers.get('X-Line-Signature')
+    body = request.get_data(as_text=True)
+    app.logger.info(f"Request body: {body}")
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return "OK"
+
+
+@app.route("/resetdb")
+def reset_db():
+    """手動清除 Firestore 知識庫集合並重建初始資料。"""
+    if not db:
+        return "❌ Firestore 客戶端未初始化，無法執行重設。"
+    
+    try:
+        # 清除企業知識庫
+        docs = db.collection(KNOWLEDGE_COLLECTION).list_documents()
+        deleted_count = 0
+        batch = db.batch()
+        for doc in docs:
+            batch.delete(doc)
+            deleted_count += 1
+        
+        if deleted_count > 0:
+             batch.commit()
+             print(f"舊的知識庫集合 ({KNOWLEDGE_COLLECTION}) 中 {deleted_count} 筆資料已移除。")
+        else:
+             print("知識庫集合為空，無需刪除。")
+
+        initialize_knowledge_base() 
+        
+        return "✅ Firestore 資料庫已清除並重新初始化完成。"
+    except Exception as e:
+        print(f"❌ Firestore 資料庫重設失敗: {e}")
+        return f"❌ 資料庫重設失敗: {e}"
+
+
+# ========= 處理文字訊息 【修改】加入指令處理與個人化查詢 =========
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    user_msg = event.message.text
+    user_id = event.source.user_id # 獲取用戶 ID
+    print(f"[User Message]: {user_msg}")
+
+    # 定義行程記錄指令前綴
+    REMINDER_COMMAND_PREFIXES = ["/記下:", "/記下："]
+    
+    command_found = False
+    reply_text = ""
+    
+    # 1. 檢查並處理 REMINDER command
+    for prefix in REMINDER_COMMAND_PREFIXES:
+        if user_msg.startswith(prefix):
+            reminder_content = user_msg[len(prefix):].strip()
+            command_found = True
+            if reminder_content:
+                # 呼叫新增的記錄函式
+                success, message = record_reminder(user_id, reminder_content)
+                reply_text = message
+            else:
+                reply_text = f"請在指令後提供要記下的內容。格式範例：/記下: 11/26 13:30 去大潤發"
+            break
+
+    if command_found:
+        # 如果找到並處理了命令 (記下行程)，則回覆結果
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+    else:
+        # 2. 正常的問答流程 (RAG + Gemini + 個人行程查詢)
+        # 傳入 user_id 讓 Gemini 可以查詢個人行程
+        reply_text = GEMINI_response(user_msg, user_id) 
+        print(f"[Gemini Reply]: {reply_text}")
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+
+# Postback 和 MemberJoinedEvent 處理保持不變
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    print(f"[Postback Data]: {event.postback.data}")
+
+@handler.add(MemberJoinedEvent)
+def welcome_new_member(event):
+    try:
+        uid = event.joined.members[0].user_id
+        if event.source.type == 'group':
+            gid = event.source.group_id
+            profile = line_bot_api.get_group_member_profile(gid, uid)
+            name = profile.display_name
+        else:
+            name = "新朋友"
+            
+        message = TextSendMessage(text=f"👋 歡迎 {name} 加入！我是由 Gemini 驅動的 AI 助手。")
+        line_bot_api.reply_message(event.reply_token, message)
+    except Exception as e:
+        print(f"發送歡迎訊息失敗: {e}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"👋 歡迎新成員加入！"))
+
+
+# ========= 啟動 Flask =========
+if __name__ == "__main__":
+    initialize_knowledge_base() 
+    
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port)
