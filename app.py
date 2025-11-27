@@ -250,13 +250,9 @@ def GEMINI_response_with_tools(user_text, user_id):
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
     
     # 步驟 1: 建立工具配置，並準備 RAG 上下文
-    # 將 record_reminder 註冊為工具
     available_tools = [record_reminder] 
     
-    # 1.1 RAG 檢索企業知識
     rag_context, _ = query_knowledge_base(user_text, top_k=5)
-    
-    # 1.2 讀取使用者個人行程 (僅用於 RAG 查詢上下文，不作為工具)
     user_reminders = get_user_reminders(user_id)
     personal_context = "\n".join(user_reminders)
     
@@ -280,13 +276,17 @@ def GEMINI_response_with_tools(user_text, user_id):
     )
     
     # 2. 第一次 API 呼叫 (讓模型決定是回答還是呼叫工具)
+    # 【修正點】: 使用標準的 types.Part 建立方式，避免 TypeError
     history = [
-        types.Content(role="user", parts=[types.Part.from_text(user_text)])
+        types.Content(
+            role="user", 
+            parts=[types.Part(text=user_text)]
+        )
     ]
     
     config = types.GenerateContentConfig(
         temperature=0.3,
-        tools=available_tools + [{"google_search": {}}], # 加入 Google Search
+        tools=available_tools + [{"google_search": {}}], 
         system_instruction=system_instruction
     )
     
@@ -316,7 +316,7 @@ def GEMINI_response_with_tools(user_text, user_id):
                 )]
             ))
             
-            # 第二次 API 呼叫，模型根據工具結果生成自然語言回覆
+            # 第二次 API 呼叫
             final_response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=history,
