@@ -98,6 +98,7 @@ def get_embedding(text):
 def initialize_knowledge_base():
     """
     檢查 Firestore 資料庫，如果沒有資料則插入初始資料並生成向量。
+    【使用自定義 ID】
     """
     if not client or not db:
         print("警告：LLM 或 Firestore 客戶端未初始化，跳過知識庫初始化。")
@@ -123,6 +124,7 @@ def initialize_knowledge_base():
                 embedding_json = json.dumps(embedding) 
                 
                 try:
+                    # 使用 document(doc_id).set() 自定義 ID
                     db.collection(KNOWLEDGE_COLLECTION).document(doc_id).set({
                         'content': content,
                         'embedding_json': embedding_json,
@@ -138,6 +140,7 @@ def initialize_knowledge_base():
 
 def query_knowledge_base(query_text, top_k=5):
     """從 Firestore 資料庫中檢索與查詢最相關的文檔 (企業知識)。"""
+    # 邏輯與之前版本相同，負責檢索企業知識
     if not db:
         return "", False
 
@@ -177,22 +180,11 @@ def query_knowledge_base(query_text, top_k=5):
 
     return "\n".join(context), is_high_confidence
 
-# -------------------------------------------------------------
-# 【Function Calling 工具函式】
-# -------------------------------------------------------------
-def record_reminder(user_id: str, raw_text: str) -> str:
-    """
-    將用戶輸入的原始行程文字寫入 Firestore 的 'reminders' 集合。
-    
-    Args:
-        user_id: 唯一識別用戶的 LINE ID。
-        raw_text: 用戶要求記下的行程內容。
-        
-    Returns:
-        JSON 格式的字串，包含 status 和 message。
-    """
+
+def record_reminder(user_id, raw_text):
+    """將用戶輸入的原始行程文字寫入 Firestore 的 'reminders' 集合。"""
     if not db:
-        return json.dumps({"status": "error", "message": "Firestore 客戶端未初始化，無法記錄。"})
+        return False, "Firestore 客戶端未初始化，無法記錄。"
     
     try:
         db.collection(REMINDER_COLLECTION).add({
@@ -202,10 +194,10 @@ def record_reminder(user_id: str, raw_text: str) -> str:
             'is_completed': False,
         })
         
-        return json.dumps({"status": "success", "message": f"已成功記錄行程：『{raw_text}』"})
+        return True, f"✅ 已為您記下行程：\n「{raw_text}」"
     except Exception as e:
         print(f"[Firestore Record Error] 無法記錄行程: {e}")
-        return json.dumps({"status": "error", "message": f"記錄行程失敗：{e}"})
+        return False, f"❌ 記錄行程失敗：{e}"
 
 
 def get_user_reminders(user_id):
@@ -218,7 +210,6 @@ def get_user_reminders(user_id):
     
     reminders_list = []
     try:
-        # 查詢需要複合索引的語句
         docs = db.collection(REMINDER_COLLECTION)\
                  .where('user_id', '==', user_id)\
                  .where('is_completed', '==', False)\
@@ -235,103 +226,105 @@ def get_user_reminders(user_id):
             reminders_list.append(f"行程 {i+1}. 內容: {data['raw_text']} (記錄於: {time_str})")
             
     except Exception as e:
-        # 捕獲並打印索引錯誤
+        # 請務必在 Firebase Console 中建立複合索引！
         print(f"[Firestore Read Error] 無法讀取行程: {e}")
         return []
 
     return reminders_list
 
 
-def GEMINI_response_with_tools(user_text, user_id):
+def GEMINI_response(user_text, user_id):
     """
-    使用 Function Calling (工具呼叫) 來處理行程記錄和 RAG 查詢。
+    所有非指令的輸入都進入 RAG 檢索流程 (企業知識 + 個人行程)，然後交給模型。
     """
     if not client:
         return "⚠️ Gemini 客戶端未成功初始化，請檢查您的 GEMINI_API_KEY 。"
+
+    # 1. RAG 檢索企業知識
+    rag_context, is_high_confidence = query_knowledge_base(user_text, top_k=5)
     
-    # 步驟 1: 建立工具配置，並準備 RAG 上下文
-    available_tools = [record_reminder] 
-    
-    rag_context, _ = query_knowledge_base(user_text, top_k=5)
+    # 2. 讀取使用者個人行程
     user_reminders = get_user_reminders(user_id)
     personal_context = "\n".join(user_reminders)
     
+    # 3. 組合提示詞 (Prompt Augmentation)
+    tools_config = []
     full_context_parts = []
+
     if rag_context:
         full_context_parts.append(f"【企業知識】:\n{rag_context}")
     if personal_context:
         full_context_parts.append(f"【您的個人行程（未完成事項）】:\n{personal_context}")
-    full_context = "\n---\n".join(full_context_parts)
-    
-    
-    # 1.3 設置 System Instruction
-    system_instruction = (
-        "你是一位專業且樂於助人的助理。你擁有一份【企業知識】和一份【您的個人行程】。"
-        "請嚴格遵守以下規則：\n"
-        "1. 如果用戶要求『記下』、『幫我記錄』或『提醒我』某件事，你必須呼叫 `record_reminder` 工具，並將用戶要求的內容作為 `raw_text` 參數。\n"
-        "2. 當用戶詢問與 CONTEXT 中任一部分相關的問題時，請直接使用 CONTEXT 中的資訊回答。\n"
-        "3. 當用戶詢問名字時，請參考個人行程記錄回答，例如：『根據您的記錄，您曾記下您叫Eric。』\n"
-        "4. 對於其他通用問題或 CONTEXT 不足時，使用 Google Search。\n"
-        f"RAG CONTEXT:\n===\n{full_context}\n==="
-    )
-    
-    # 2. 第一次 API 呼叫 (讓模型決定是回答還是呼叫工具)
-    # 【修正點】: 使用標準的 types.Part 建立方式，避免 TypeError
-    history = [
-        types.Content(
-            role="user", 
-            parts=[types.Part(text=user_text)]
-        )
-    ]
-    
-    config = types.GenerateContentConfig(
-        temperature=0.3,
-        tools=available_tools + [{"google_search": {}}], 
-        system_instruction=system_instruction
-    )
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=history,
-            config=config,
-        )
 
-        # 3. 處理 Function Calling (工具呼叫)
-        if response.function_calls:
-            call = response.function_calls[0] 
-            
-            # 呼叫 Python 函式，傳入 user_id 和模型解析出來的參數
-            tool_response = globals()[call.name](user_id, **dict(call.args))
-            
-            print(f"[Function Calling] 呼叫 {call.name}, 參數: {call.args}, 結果: {tool_response}")
-            
-            # 將工具結果回傳給 Gemini 進行第二次呼叫，生成最終自然語言回覆
-            history.append(response.candidates[0].content)
-            history.append(types.Content(
-                role="tool",
-                parts=[types.Part.from_function_response(
-                    name=call.name,
-                    response=json.loads(tool_response)
-                )]
-            ))
-            
-            # 第二次 API 呼叫
-            final_response = client.models.generate_content(
+    full_context = "\n---\n".join(full_context_parts)
+
+    if full_context:
+        # 只要有任何上下文，就啟用 Google Search 進行補充
+        tools_config = [{"google_search": {}}]
+        
+        # 調整 System Instruction，強調基於 Context 回答 (符合 HackMD 的意圖驅動)
+        system_instruction = (
+            "你是一位專業且樂於助人的助理。你擁有一份【企業知識】和一份【您的個人行程】。 "
+            "請嚴格根據以下規則回答：\n"
+            "1. 當用戶詢問與 CONTEXT 中任一部分相關的問題時，請**直接且完整地**使用 CONTEXT 中的資訊來回答。\n"
+            "2. 當用戶詢問『我的名字是什麼？』，請**特別注意**：如果【您的個人行程】CONTEXT 中有明確的提示（例如：『我叫Eric』），請基於該記錄回答：『根據您的行程記錄，您曾記下您叫Eric。』，避免直接聲稱知道您的名字。\n"
+            "3. 對於其他通用問題或 CONTEXT 不足時，使用 Google Search。\n"
+            f"所有可用的 CONTEXT:\n===\n{full_context}\n==="
+        )
+        final_prompt = user_text
+    else:
+        # 沒有任何上下文，只使用 Google Search
+        tools_config = [{"google_search": {}}]
+        system_instruction = "你是一位樂於助人的助理，請使用最新資訊來回答問題。"
+        final_prompt = user_text
+
+
+    max_retries = 3
+    delay = 2
+
+    for attempt in range(max_retries):
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.5, 
+                max_output_tokens=1500,
+                tools=tools_config,
+                system_instruction=system_instruction, 
+            )
+
+            response = client.models.generate_content(
                 model="gemini-2.5-flash",
-                contents=history,
+                contents=final_prompt,
                 config=config,
             )
-            return final_response.text.strip()
-            
-        else:
-            # 如果沒有呼叫工具，直接返回模型的第一輪文字回覆 (RAG 查詢或通用回答)
-            return response.text.strip()
 
-    except Exception as e:
-        print(traceback.format_exc())
-        return "⚠️ 服務發生錯誤，無法處理您的請求。"
+            if not response.text:
+                # ... (錯誤處理保持不變)
+                error_detail = "API 回應中無文字內容。"
+                if response.candidates:
+                    finish_reason = response.candidates[0].finish_reason.name
+                    error_detail = f"模型完成原因: {finish_reason}。"
+                print(f"[Gemini Error] Generation blocked or empty. Detail: {error_detail}")
+                return f"⚠️ 內容生成失敗：{error_detail}"
 
+            answer = response.text.strip()
+            if len(answer) > 2000:
+                answer = answer[:2000] + "…（回覆過長，已截斷）"
+
+            return answer
+
+        except APIError as e:
+            # ... (重試邏輯保持不變)
+            print(f"[Gemini API Error] {e}")
+            if attempt < max_retries - 1:
+                print(f"等待 {delay} 秒後重試...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return "⚠️ 目前系統忙碌或 Gemini API 無法回應，請稍後再試。"
+
+        except Exception as e:
+            print(traceback.format_exc())
+            return "⚠️ 發生未知錯誤，請稍後再試。"
 
 # ========= LINE Webhook / Flask Routes / Handler (保持不變) =========
 @app.route('/')
@@ -384,21 +377,47 @@ def reset_db():
         return f"❌ 資料庫重設失敗: {e}"
 
 
-# ========= 處理文字訊息 (簡化為 Function Calling 流程) =========
+# ========= 處理文字訊息 (核心邏輯：區分指令與查詢) =========
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text_message(event):
     user_msg = event.message.text
     user_id = event.source.user_id 
     print(f"[User Message]: {user_msg}")
 
-    # 現在所有輸入都直接進入 Function Calling 流程
-    reply_text = GEMINI_response_with_tools(user_msg, user_id) 
-    print(f"[Gemini Reply]: {reply_text}")
+    # 定義行程記錄指令前綴
+    REMINDER_COMMAND_PREFIXES = ["/記下:", "/記下："]
+    
+    command_found = False
+    reply_text = ""
+    
+    # 1. 檢查並處理明確的寫入指令
+    for prefix in REMINDER_COMMAND_PREFIXES:
+        if user_msg.startswith(prefix):
+            reminder_content = user_msg[len(prefix):].strip()
+            command_found = True
+            if reminder_content:
+                success, message = record_reminder(user_id, reminder_content)
+                reply_text = message
+            else:
+                reply_text = f"請在指令後提供要記下的內容。格式範例：/記下: 11/26 13:30 去大潤發"
+            break
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    if command_found:
+        # 如果是指令 (寫入資料庫)，直接回覆指令結果
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+    else:
+        # 2. 如果不是指令，就走 RAG 查詢流程 (意圖驅動)
+        # 任何非指令的輸入都視為查詢，讓 RAG 和 Gemini 處理
+        reply_text = GEMINI_response(user_msg, user_id) 
+        print(f"[Gemini Reply]: {reply_text}")
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
 
 # Postback 和 MemberJoinedEvent 處理保持不變
 @handler.add(PostbackEvent)
