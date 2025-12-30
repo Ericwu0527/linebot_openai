@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 
 # 引入 Firestore 與 GenAI
-from google.cloud import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -87,12 +87,13 @@ def record_reminder(user_id, raw_text):
 def get_user_reminders(user_id):
     try:
         docs = db.collection(REMINDER_COLLECTION)\
-                 .where('user_id', '==', user_id)\
-                 .where('is_completed', '==', False)\
+                 .where(filter=FieldFilter('user_id', '==', user_id))\
+                 .where(filter=FieldFilter('is_completed', '==', False))\
                  .order_by('recorded_at', direction=firestore.Query.DESCENDING)\
                  .limit(10).stream()
         return [f"• {d.to_dict()['raw_text']}" for d in docs]
-    except:
+    except Exception as e:
+        print(f"讀取行程警告: {e}")
         return []
 
 def query_knowledge_base(query_text):
