@@ -11,16 +11,10 @@ import math
 import json
 from datetime import datetime
 
-# ======================= 修正後的 Firestore Import 區塊 =======================
-# 1. 核心 firestore 用於 db = firestore.Client()
+# ======================= Firestore & 語法修正 =======================
 from google.cloud import firestore
-
-# 2. firestore_v1 作為別名，用於 SERVER_TIMESTAMP 和 Query.DESCENDING
-import google.cloud.firestore_v1 as firestore_module
-
-# 3. 引入過濾器，解決原本的 where 語法警告
-from google.cloud.firestore_v1.base_query import FieldFilter
-# ===========================================================================
+import google.cloud.firestore_v1 as firestore_module 
+from google.cloud.firestore_v1.base_query import FieldFilter 
 
 # 引入 Google GenAI
 from google import genai
@@ -50,7 +44,6 @@ handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 # 初始化 Gemini & Firestore
 try:
     client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
-    # 這裡使用的 firestore 來自於第 14 行的直接引入
     db = firestore.Client()
     print("✅ 系統服務初始化成功", flush=True)
 except Exception as e:
@@ -60,7 +53,7 @@ except Exception as e:
 
 def save_reminder_tool(content: str):
     """
-    當使用者提到未來的行程或計畫（如：『明天我要去...』），請調用此工具。
+    當使用者提到未來的行程、計畫、預約、要去的地方時（例如：『明天我要去...』、『幫我記下...』），請務必調用此工具。
     """
     return {"status": "intent_detected", "content": content}
 
@@ -81,7 +74,7 @@ def get_embedding(text):
         return None
 
 def record_reminder(user_id, raw_text):
-    print(f"DEBUG: 正在寫入行程 -> {raw_text}", flush=True)
+    print(f"DEBUG: 正在執行資料庫寫入 -> {raw_text}", flush=True)
     try:
         db.collection(REMINDER_COLLECTION).add({
             'user_id': user_id,
@@ -124,7 +117,7 @@ def query_knowledge_base(query_text):
         pass
     return "", False
 
-# ======================= Gemini 回應邏輯 =======================
+# ======================= Gemini 回應邏輯 (強化版) =======================
 
 def GEMINI_response(user_text, user_id):
     if not client: return "⚠️ API 未就緒"
@@ -133,44 +126,56 @@ def GEMINI_response(user_text, user_id):
     reminders = get_user_reminders(user_id)
     personal_context = "\n".join(reminders) if reminders else "目前無未完成行程。"
     
+    # 這裡的指令加入了「強迫性」，防止 AI 進入猶豫模式
     system_instruction = (
         "你是一位行動派助理。請遵守以下規則：\n"
-        "1. 當使用者提到行程計畫時，直接調用 save_reminder_tool。\n"
-        "2. 關於公司規定請參考【企業知識】。\n"
-        "3. 關於使用者個人事項請參考【個人行程】。\n"
+        "1. 只要使用者提到任何行程、計畫、預約、要去哪裡、要幹嘛，"
+        "請『立刻』調用 save_reminder_tool，不要徵求同意。\n"
+        "2. 提取出的內容請精簡，例如『明天去松山運動』。\n"
+        "3. 公司相關問題參考【企業知識】，個人行程參考【個人行程】。\n"
         f"【企業知識】：{rag_context}\n"
         f"【個人行程】：{personal_context}"
     )
     
     try:
         config = types.GenerateContentConfig(
-            temperature=0.2, 
+            temperature=0.3, # 稍微提高靈活性
             tools=[save_reminder_tool], 
             system_instruction=system_instruction
         )
+        
         response = client.models.generate_content(
             model="gemini-2.0-flash", 
             contents=user_text, 
             config=config
         )
         
+        # 遍歷回應的所有部分，尋找工具呼叫或文字
         if response.candidates and response.candidates[0].content.parts:
+            # 優先檢查是否有工具呼叫
             for part in response.candidates[0].content.parts:
                 if part.function_call:
                     fn = part.function_call
                     extracted_text = fn.args.get("content", user_text)
                     success, msg = record_reminder(user_id, extracted_text)
                     return msg
-        return response.text if response.text else "我不太明白。"
+            
+            # 如果沒有工具呼叫，則返回 AI 的文字回答
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    return part.text
+
+        return "我收到您的訊息了，請問有什麼需要我幫忙記錄的嗎？"
+        
     except Exception as e:
         print(f"❌ Gemini 錯誤: {e}", flush=True)
-        return "⚠️ 服務暫時無法回應。"
+        return "⚠️ 服務暫時無法回應，請稍後再試。"
 
 # ======================= Flask 路由 =======================
 
 @app.route('/')
 def index():
-    return "✅ LINE Bot is active!"
+    return "✅ LINE Bot Flask App is running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -186,10 +191,17 @@ def callback():
 def handle_text_message(event):
     user_msg = event.message.text
     user_id = event.source.user_id
+    
+    # Render Logs 即時輸出
     print(f"\n[LINE User Message]: {user_msg}", flush=True)
+    
     reply_text = GEMINI_response(user_msg, user_id)
-    print(f"[AI Response]: {reply_text}", flush=True)
+    
+    print(f"[AI Response]: {reply_text}\n", flush=True)
+    
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+# ======================= 初始化知識庫 =======================
 
 def initialize_knowledge_base():
     try:
@@ -203,9 +215,10 @@ def initialize_knowledge_base():
                         'content': item['content'],
                         'embedding_json': json.dumps(emb)
                     })
-    except:
-        pass
+    except Exception as e:
+        print(f"初始化知識庫出錯: {e}")
 
 if __name__ == "__main__":
     initialize_knowledge_base()
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port)
