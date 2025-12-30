@@ -8,6 +8,7 @@ import time
 import traceback
 import math
 import json
+import sys
 from datetime import datetime
 
 # 引入 Firestore 與 GenAI
@@ -193,8 +194,20 @@ def reset_db():
 def handle_text_message(event):
     user_msg = event.message.text
     user_id = event.source.user_id
+    
+    # 關鍵修改：手動印出使用者訊息到控制台
+    print(f"\n[LINE User Message]: {user_msg}", flush=True) 
+    # flush=True 會強制將文字立刻推送到 Render 的 Logs，而不會卡在緩衝區
+    
     reply_text = GEMINI_response(user_msg, user_id)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+    
+    # 關鍵修改：印出 AI 的回應
+    print(f"[AI Response]: {reply_text}\n", flush=True)
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=reply_text)
+    )
 
 # ======================= 初始化與啟動 =======================
 
