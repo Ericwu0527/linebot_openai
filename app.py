@@ -13,7 +13,7 @@ from datetime import datetime
 
 # 引入 Firestore 與 GenAI
 from google.cloud import firestore
-from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.base_query as firestore
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
