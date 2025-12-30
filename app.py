@@ -143,7 +143,8 @@ def GEMINI_response(user_text, user_id):
             contents=user_text,
             config=config,
         )
-
+        print(f"[Debug] Model Candidates Parts: {response.candidates[0].content.parts}", flush=True)
+        
         # 檢查 Function Call
         if response.candidates and response.candidates[0].content.parts:
             for part in response.candidates[0].content.parts:
