@@ -124,9 +124,9 @@ def GEMINI_response(user_text, user_id):
 
     tools = [save_reminder_tool]
     system_instruction = (
-        "你是一位專業助理。你具備查詢企業知識與記錄個人行程的能力。\n"
-        "1. 如果使用者要記錄行程，請調用 save_reminder_tool。\n"
-        "2. 關於公司規定請參考企業知識，關於使用者行程請參考個人行程。\n"
+        "你是一位行動派助理。當使用者提到未來的行程、計畫或動作時（例如：『明天我要去...』、『幫我記下...』），"
+        "請『不要詢問』，直接調用 save_reminder_tool 來儲存行程。\n"
+        "只有在資訊極度不明確時才詢問細節。\n"
         f"【企業知識】：{rag_context}\n"
         f"【個人行程】：{personal_context}"
     )
