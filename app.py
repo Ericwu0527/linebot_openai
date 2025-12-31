@@ -16,37 +16,33 @@ from google.cloud import firestore
 import google.cloud.firestore_v1 as firestore_module 
 from google.cloud.firestore_v1.base_query import FieldFilter 
 
-# Google GenAI
+# Google GenAI SDK
 from google import genai
 from google.genai import types
 
 # ======================= 設定區域 =======================
-KNOWLEDGE_COLLECTION = "knowledge_base"
 REMINDER_COLLECTION = "reminders"
 
 app = Flask(__name__)
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 
-# 初始化服務
+# 初始化
 try:
     client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
     db = firestore.Client()
-    print("✅ 系統服務初始化成功", flush=True)
+    print("✅ 穩定版系統初始化成功", flush=True)
 except Exception as e:
     print(f"❌ 初始化失敗: {e}", flush=True)
 
-# ======================= 工具與資料庫函式 =======================
+# ======================= 工具與資料庫 =======================
 
 def save_reminder_tool(content: str):
-    """
-    Action: 儲存使用者的行程。
-    Requirement: 只要使用者提到計畫要做的事，請調用此工具。
-    """
-    return {"status": "intent_confirmed", "content": content}
+    """用於紀錄行程。當使用者提到未來的計畫、要去哪裡、做什麼事時調用。"""
+    return {"status": "intent_detected", "content": content}
 
 def record_reminder(user_id, raw_text):
-    print(f"DEBUG: [資料庫動作] 準備寫入 -> {raw_text}", flush=True)
+    print(f"DEBUG: [寫入動作] {raw_text}", flush=True)
     try:
         db.collection(REMINDER_COLLECTION).add({
             'user_id': user_id,
@@ -54,11 +50,10 @@ def record_reminder(user_id, raw_text):
             'recorded_at': firestore_module.SERVER_TIMESTAMP,
             'is_completed': False,
         })
-        print("DEBUG: [資料庫動作] 寫入完成！", flush=True)
-        return True, f"✅ 好的，我已經幫您記下了：\n「{raw_text}」"
+        return True, f"✅ 已為您記下行程：\n「{raw_text}」"
     except Exception as e:
         print(f"❌ 資料庫錯誤: {e}", flush=True)
-        return False, f"❌ 儲存失敗，請檢查資料庫權限。"
+        return False, f"❌ 儲存失敗，請檢查規則。"
 
 def get_user_reminders(user_id):
     try:
@@ -66,7 +61,7 @@ def get_user_reminders(user_id):
                  .where(filter=FieldFilter('user_id', '==', user_id))\
                  .where(filter=FieldFilter('is_completed', '==', False))\
                  .order_by('recorded_at', direction=firestore_module.Query.DESCENDING)\
-                 .limit(10).stream()
+                 .limit(5).stream()
         return [d.to_dict().get('raw_text', '') for d in docs]
     except:
         return []
@@ -74,34 +69,28 @@ def get_user_reminders(user_id):
 # ======================= 核心 AI 邏輯 =======================
 
 def GEMINI_response(user_text, user_id):
-    if not client: return "⚠️ AI 模組未就緒"
+    if not client: return "⚠️ 系統未就緒"
     
-    # 1. 注入台灣時間
+    # 1. 注入時間
     now = datetime.now() + timedelta(hours=8)
     current_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
     
-    # 2. 獲取行程上下文 (Context)
-    reminders = get_user_reminders(user_id)
+    # 2. 判斷是否為查詢意圖
+    is_query = any(q in user_text for q in ["去哪", "做什麼", "有沒有", "行程"])
+    reminders = get_user_reminders(user_id) if is_query else []
     personal_context = "\n".join([f"- {r}" for r in reminders]) if reminders else "目前無記錄。"
 
-    # 3. 系統指令 (極簡化，避免 AI 混淆)
+    # 3. 指令強化
     system_instruction = (
         f"現在時間：{current_time_str}。\n"
-        "你是秘書。規則：\n"
-        "1. 使用者描述行程或要求記下：立刻調用 save_reminder_tool。\n"
-        "2. 使用者『詢問』他要去哪或有什麼事：直接根據 Context 回答。\n"
-        f"【現有行程】:\n{personal_context}"
+        "你是行程秘書。規則：\n"
+        "1. 使用者描述新計畫：立刻呼叫 save_reminder_tool，不准廢話。\n"
+        "2. 使用者問行程（去哪、做什麼）：禁調工具！直接根據 context 回答。\n"
+        f"【 context 】:\n{personal_context}"
     )
     
     try:
-        # 設定安全設定，防止 AI 因為敏感字眼拒絕回覆
-        safety_settings = [
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
-        ]
-
+        # 使用更穩定的 1.5-flash
         config = types.GenerateContentConfig(
             temperature=0,
             tools=[save_reminder_tool],
@@ -109,49 +98,56 @@ def GEMINI_response(user_text, user_id):
                 function_calling_config=types.FunctionCallingConfig(mode="AUTO")
             ),
             system_instruction=system_instruction,
-            safety_settings=safety_settings # 注入安全設定
+            # 關閉安全過濾
+            safety_settings=[
+                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+            ]
         )
         
+        # 呼叫 API
         response = client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-1.5-flash", # 切換回穩定版
             contents=user_text,
             config=config
         )
 
-        # 4. 強化解析邏輯
-        if not response.candidates or len(response.candidates) == 0:
-            return "AI 目前無法回應（可能被過濾），請試著簡短說明您的行程。"
+        # DEBUG: 印出完整回應，觀察是否還有迴圈或過濾
+        print(f"DEBUG Response: {response.candidates[0].finish_reason if response.candidates else 'Empty'}", flush=True)
 
-        content = response.candidates[0].content
-        if not content or not content.parts:
-            return "AI 回傳了空的內容，請稍後再試。"
+        if not response.candidates:
+            return "抱歉，系統目前無法處理這段訊息，請試著換個說法。"
 
-        # 優先處理 Function Call
-        for part in content.parts:
+        parts = response.candidates[0].content.parts
+        if not parts:
+            return "AI 沒有產生任何回覆。"
+
+        # 解析零件
+        for part in parts:
+            # 優先處理工具呼叫
             if hasattr(part, 'function_call') and part.function_call:
-                # 如果是記錄動作
                 fn = part.function_call
-                print(f"DEBUG: [AI 指令] 觸發 save_reminder_tool", flush=True)
-                # 提取參數，如果提取失敗則用原文
-                extracted = fn.args.get("content", user_text) if fn.args else user_text
-                _, msg = record_reminder(user_id, extracted)
+                # 如果是問句卻觸發工具，代表 AI 判斷失誤，改為提示使用者
+                if is_query: return "請問您是要記錄還是查詢行程呢？"
+                
+                print(f"DEBUG: 觸發功能調用 {fn.name}", flush=True)
+                content = fn.args.get("content", user_text)
+                _, msg = record_reminder(user_id, content)
                 return msg
-        
-        # 處理文字回覆
-        for part in content.parts:
+            
+            # 處理文字
             if hasattr(part, 'text') and part.text:
                 return part.text.strip()
 
-        return "我收到了您的訊息，請問需要幫您記錄下來嗎？"
+        return "我收到訊息了，請問有什麼需要幫您記錄的嗎？"
         
     except Exception as e:
-        print(f"❌ Gemini Error:\n{traceback.format_exc()}", flush=True)
-        return "⚠️ 發生未知錯誤，請稍後再試。"
+        print(f"❌ 錯誤詳情:\n{traceback.format_exc()}", flush=True)
+        return "⚠️ 服務忙碌，請稍後再試。"
 
-# ======================= Flask 路由 =======================
-
-@app.route('/')
-def index(): return "✅ Bot is active"
+# ======================= 路由處理 =======================
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -167,15 +163,18 @@ def callback():
 def handle_text_message(event):
     user_msg = event.message.text
     user_id = event.source.user_id
+    
     print(f"\n[User]: {user_msg}", flush=True)
-    
     start_time = time.time()
-    reply_text = GEMINI_response(user_msg, user_id)
-    duration = time.time() - start_time
     
-    print(f"[AI Reply ({round(duration, 2)}s)]: {reply_text}\n", flush=True)
+    reply_text = GEMINI_response(user_msg, user_id)
+    
+    print(f"[AI Reply ({round(time.time() - start_time, 2)}s)]: {reply_text}", flush=True)
     
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+
+@app.route('/')
+def index(): return "✅ Alive"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
