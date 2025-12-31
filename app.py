@@ -65,17 +65,29 @@ def record_reminder(user_id, raw_text):
 def GEMINI_response(user_text, user_id):
     if not client: return "⚠️ API 未就緒"
     
+    # 1. 先抓取現有行程（這很重要，AI 才能回答你「要去哪」）
+    reminders_list = get_user_reminders(user_id)
+    personal_context = "\n".join(reminders_list) if reminders_list else "目前沒有任何行程記錄。"
+    
     try:
-        # 修正後的模式：ANY 代表「強制模型必須選擇一個工具執行」
+        # 模式改回 AUTO，讓 AI 決定要「講話」還是「用工具」
         config = types.GenerateContentConfig(
             temperature=0, 
             tools=[save_reminder_tool],
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
-                    mode="ANY", # 這裡是關鍵修正
+                    mode="AUTO", # 恢復智慧模式
                 )
             ),
-            system_instruction="你是一個專用的行程提取器。將使用者的所有計畫或行程轉化為 save_reminder_tool 的 content。"
+            system_instruction=(
+                "你是一位行程秘書。請根據以下邏輯處理訊息：\n"
+                "【場景 A：記錄行程】\n"
+                "當使用者提到未來的計畫（如：明天要去...、幫我記下...）時，請『務必調用』save_reminder_tool。\n\n"
+                "【場景 B：回答問題】\n"
+                "當使用者詢問自己的行程（如：我明天要去哪？、我有什麼行程？）時，請『絕對不要』調用工具，"
+                "請直接根據下方的【個人行程 context】回答使用者。\n\n"
+                f"【個人行程 context】:\n{personal_context}"
+            )
         )
         
         response = client.models.generate_content(
@@ -84,29 +96,30 @@ def GEMINI_response(user_text, user_id):
             config=config
         )
 
-        # 輸出完整結構以便日誌追蹤
-        print(f"DEBUG - Full Response: {response}", flush=True)
-
-        if response.candidates:
+        # 這裡的解析邏輯要非常清楚
+        if response.candidates and response.candidates[0].content.parts:
             parts = response.candidates[0].content.parts
-            if parts:
-                for part in parts:
-                    # 1. 檢查 Function Call (優先)
-                    if part.function_call:
-                        print(f"DEBUG: [成功觸發] AI 執行工具: {part.function_call.name}", flush=True)
-                        extracted_text = part.function_call.args.get("content", user_text)
-                        success, msg = record_reminder(user_id, extracted_text)
-                        return msg
-                    
-                    # 2. 檢查文字 (只有在沒有工具時才會跑到這)
-                    if part.text:
-                        return part.text
+            
+            # 先檢查是否有工具呼叫（優先處理記錄意圖）
+            for part in parts:
+                if part.function_call:
+                    print(f"DEBUG: [觸發記錄] AI 判定為新行程", flush=True)
+                    fn = part.function_call
+                    extracted_text = fn.args.get("content", user_text)
+                    success, msg = record_reminder(user_id, extracted_text)
+                    return msg
+            
+            # 如果沒有工具呼叫，則處理 AI 的文字回覆（回答問題）
+            for part in parts:
+                if part.text:
+                    print(f"DEBUG: [觸發對話] AI 判定為查詢或聊天", flush=True)
+                    return part.text
 
-        return "我不確定如何記錄這項訊息，請嘗試更具體的描述。"
+        return "我不確定如何處理這項訊息，您可以試著說『幫我記下...』或詢問『我明天有什麼行程？』"
         
     except Exception as e:
-        print(f"❌ Gemini 錯誤詳情:\n{traceback.format_exc()}", flush=True)
-        return f"⚠️ 發生錯誤: {str(e)}"
+        print(f"❌ Gemini 錯誤:\n{traceback.format_exc()}", flush=True)
+        return "⚠️ 服務忙碌中，請稍後再試。"
 # ======================= Flask 路由 =======================
 
 @app.route('/')
