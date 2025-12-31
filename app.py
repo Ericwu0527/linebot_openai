@@ -66,17 +66,16 @@ def GEMINI_response(user_text, user_id):
     if not client: return "⚠️ API 未就緒"
     
     try:
-        # 1. 設定強制調用模式
-        # mode="REQUIRED" 會逼 AI 即使你說「你好」，它也得硬塞進 save_reminder_tool 裡
+        # 修正後的模式：ANY 代表「強制模型必須選擇一個工具執行」
         config = types.GenerateContentConfig(
             temperature=0, 
             tools=[save_reminder_tool],
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
-                    mode="REQUIRED", # 強制執行工具
+                    mode="ANY", # 這裡是關鍵修正
                 )
             ),
-            system_instruction="你是一個機器人，你的唯一任務就是把看到的所有文字丟進 save_reminder_tool 的 content 參數裡。"
+            system_instruction="你是一個專用的行程提取器。將使用者的所有計畫或行程轉化為 save_reminder_tool 的 content。"
         )
         
         response = client.models.generate_content(
@@ -85,33 +84,29 @@ def GEMINI_response(user_text, user_id):
             config=config
         )
 
-        # 2. 【最重要】印出完整回應結構，我們在 Render Logs 裡抓兇手
+        # 輸出完整結構以便日誌追蹤
         print(f"DEBUG - Full Response: {response}", flush=True)
 
         if response.candidates:
-            candidate = response.candidates[0]
-            if candidate.content and candidate.content.parts:
-                for part in candidate.content.parts:
-                    # 檢查 Function Call
-                    # 在某些 SDK 版本中，這可能在 part.function_call
-                    fn = getattr(part, 'function_call', None)
-                    if fn:
-                        print(f"DEBUG: [成功] AI 呼叫了工具: {fn.name}", flush=True)
-                        extracted_text = fn.args.get("content", user_text)
+            parts = response.candidates[0].content.parts
+            if parts:
+                for part in parts:
+                    # 1. 檢查 Function Call (優先)
+                    if part.function_call:
+                        print(f"DEBUG: [成功觸發] AI 執行工具: {part.function_call.name}", flush=True)
+                        extracted_text = part.function_call.args.get("content", user_text)
                         success, msg = record_reminder(user_id, extracted_text)
                         return msg
                     
-                    # 檢查文字
-                    txt = getattr(part, 'text', None)
-                    if txt:
-                        return txt
+                    # 2. 檢查文字 (只有在沒有工具時才會跑到這)
+                    if part.text:
+                        return part.text
 
-        return "DEBUG: AI 既沒給工具指令也沒給文字，請檢查 Logs 中的 Full Response。"
+        return "我不確定如何記錄這項訊息，請嘗試更具體的描述。"
         
     except Exception as e:
         print(f"❌ Gemini 錯誤詳情:\n{traceback.format_exc()}", flush=True)
         return f"⚠️ 發生錯誤: {str(e)}"
-
 # ======================= Flask 路由 =======================
 
 @app.route('/')
