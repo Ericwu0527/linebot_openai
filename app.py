@@ -53,7 +53,9 @@ except Exception as e:
 
 def save_reminder_tool(content: str):
     """
-    當使用者提到未來的行程、計畫、預約、要去的地方時（例如：『明天我要去...』、『幫我記下...』），請務必調用此工具。
+    Action: 儲存使用者的行程或備忘錄。
+    When to call: 只要使用者提到『時間』加上『動作』，或明確要求『記下』時。
+    Example: '明天下午2點去松山運動' -> content='明天下午2點松山運動'
     """
     return {"status": "intent_detected", "content": content}
 
@@ -128,18 +130,18 @@ def GEMINI_response(user_text, user_id):
     
     # 這裡的指令加入了「強迫性」，防止 AI 進入猶豫模式
     system_instruction = (
-        "你是一位行動派助理。請遵守以下規則：\n"
-        "1. 只要使用者提到任何行程、計畫、預約、要去哪裡、要幹嘛，"
-        "請『立刻』調用 save_reminder_tool，不要徵求同意。\n"
-        "2. 提取出的內容請精簡，例如『明天去松山運動』。\n"
-        "3. 公司相關問題參考【企業知識】，個人行程參考【個人行程】。\n"
+        "你是一個『行程記錄機器人』。你的唯一職責是將使用者的行程轉換為結構化記錄。\n"
+        "【規則】:\n"
+        "1. 只要訊息包含『時間(明天、後天、幾點)』與『事件』，必須『立刻』呼叫 save_reminder_tool。\n"
+        "2. 嚴禁回覆『我收到您的訊息了，請問有什麼需要我幫忙記錄的嗎？』這種廢話。\n"
+        "3. 如果使用者問『我要去哪』，請從【個人行程】中尋找答案，不要記錄它。\n"
         f"【企業知識】：{rag_context}\n"
         f"【個人行程】：{personal_context}"
     )
     
     try:
         config = types.GenerateContentConfig(
-            temperature=0.3, # 稍微提高靈活性
+            temperature=0.3, # 降到最低，確保穩定性
             tools=[save_reminder_tool], 
             system_instruction=system_instruction
         )
@@ -150,26 +152,29 @@ def GEMINI_response(user_text, user_id):
             config=config
         )
         
-        # 遍歷回應的所有部分，尋找工具呼叫或文字
+        # 這裡的邏輯要改：只要有工具呼叫，就只執行工具
         if response.candidates and response.candidates[0].content.parts:
-            # 優先檢查是否有工具呼叫
-            for part in response.candidates[0].content.parts:
+            parts = response.candidates[0].content.parts
+            
+            # 優先找 function_call
+            for part in parts:
                 if part.function_call:
                     fn = part.function_call
+                    # 這裡抓取 AI 提取的 content 參數
                     extracted_text = fn.args.get("content", user_text)
                     success, msg = record_reminder(user_id, extracted_text)
                     return msg
             
-            # 如果沒有工具呼叫，則返回 AI 的文字回答
-            for part in response.candidates[0].content.parts:
-                if part.text:
+            # 如果沒有工具呼叫，才找文字
+            for part in parts:
+                if part.text and part.text.strip():
                     return part.text
 
-        return "我收到您的訊息了，請問有什麼需要我幫忙記錄的嗎？"
+        return "這聽起來像是一個行程，請問需要我幫您記下來嗎？" # 備用回覆
         
     except Exception as e:
         print(f"❌ Gemini 錯誤: {e}", flush=True)
-        return "⚠️ 服務暫時無法回應，請稍後再試。"
+        return "⚠️ 服務忙碌中，請稍後。"
 
 # ======================= Flask 路由 =======================
 
