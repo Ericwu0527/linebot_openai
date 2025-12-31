@@ -11,82 +11,110 @@ import math
 import json
 from datetime import datetime
 
-# ======================= Firestore 名稱衝突修正 =======================
+# ======================= Firestore 引入區 =======================
 from google.cloud import firestore
 import google.cloud.firestore_v1 as firestore_module 
 from google.cloud.firestore_v1.base_query import FieldFilter 
 
-# 引入 Google GenAI SDK
+# 引入 Google GenAI
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+# ======================= 設定區域 =======================
+KNOWLEDGE_COLLECTION = "knowledge_base"
+REMINDER_COLLECTION = "reminders"
+RAG_CONFIDENCE_THRESHOLD = 0.5
+
 app = Flask(__name__)
+
+# LINE Bot 設定
 line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
 
-# 初始化
+# 初始化服務
 try:
     client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
     db = firestore.Client()
-    print("✅ 系統服務啟動成功", flush=True)
+    print("✅ 系統服務初始化成功", flush=True)
 except Exception as e:
     print(f"❌ 初始化失敗: {e}", flush=True)
 
-# ======================= 工具定義 =======================
+# ======================= 工具與輔助函式 =======================
 
 def save_reminder_tool(content: str):
     """
-    用於記錄行程。當使用者提到時間、地點或要做的事情時，調用此工具。
+    用於儲存使用者的行程或備忘錄。當使用者提到時間與要做的事情時調用。
     """
     return {"status": "intent_detected", "content": content}
 
-# ======================= 資料庫寫入 (加強 Log) =======================
-
 def record_reminder(user_id, raw_text):
-    # 如果看到這行，代表 AI 終於肯呼叫工具了
-    print(f"DEBUG: [Step 1] 收到 AI 指令，寫入內容 -> {raw_text}", flush=True)
+    """將行程寫入 Firestore"""
+    print(f"DEBUG: 準備寫入資料庫 -> {raw_text}", flush=True)
     try:
-        db.collection("reminders").add({
+        db.collection(REMINDER_COLLECTION).add({
             'user_id': user_id,
             'raw_text': raw_text,
             'recorded_at': firestore_module.SERVER_TIMESTAMP,
             'is_completed': False,
         })
-        print("DEBUG: [Step 2] Firestore 寫入成功！", flush=True)
+        print("DEBUG: 資料庫寫入成功", flush=True)
         return True, f"✅ 已為您記下行程：\n「{raw_text}」"
     except Exception as e:
-        # 如果這裡報 Permission Denied，請檢查你的 Firestore Rules 
-        print(f"❌ [Step 2 Error] 資料庫寫入失敗: {e}", flush=True)
-        return False, f"❌ 資料庫拒絕寫入。請確認 Firestore 規則已發佈為 true。"
+        print(f"❌ 資料庫寫入失敗: {e}", flush=True)
+        return False, f"❌ 記錄失敗：{e}"
 
-# ======================= 核心回應邏輯 (強制模式) =======================
+def get_user_reminders(user_id):
+    """從 Firestore 讀取未完成行程"""
+    try:
+        docs = db.collection(REMINDER_COLLECTION)\
+                 .where(filter=FieldFilter('user_id', '==', user_id))\
+                 .where(filter=FieldFilter('is_completed', '==', False))\
+                 .order_by('recorded_at', direction=firestore_module.Query.DESCENDING)\
+                 .limit(10).stream()
+        return [f"• {d.to_dict()['raw_text']}" for d in docs]
+    except Exception as e:
+        print(f"⚠️ 讀取行程警告: {e}", flush=True)
+        return []
+
+def get_embedding(text):
+    if not client: return None
+    try:
+        result = client.models.embed_content(model='text-embedding-004', contents=[text])
+        return result.embeddings[0].values
+    except:
+        return None
+
+def cosine_distance(vec1, vec2):
+    dot_product = sum(v1 * v2 for v1, v2 in zip(vec1, vec2))
+    magnitude_v1 = math.sqrt(sum(v1 * v1 for v1 in vec1))
+    magnitude_v2 = math.sqrt(sum(v2 * v2 for v2 in vec2))
+    return 1.0 - (dot_product / (magnitude_v1 * magnitude_v2)) if magnitude_v1 != 0 and magnitude_v2 != 0 else 1.0
+
+# ======================= 核心 AI 回應邏輯 =======================
 
 def GEMINI_response(user_text, user_id):
     if not client: return "⚠️ API 未就緒"
     
-    # 1. 先抓取現有行程（這很重要，AI 才能回答你「要去哪」）
+    # 1. 抓取行程作為上下文 (Context)
     reminders_list = get_user_reminders(user_id)
-    personal_context = "\n".join(reminders_list) if reminders_list else "目前沒有任何行程記錄。"
+    personal_context = "\n".join(reminders_list) if reminders_list else "目前沒有任何記錄。"
     
     try:
-        # 模式改回 AUTO，讓 AI 決定要「講話」還是「用工具」
         config = types.GenerateContentConfig(
             temperature=0, 
             tools=[save_reminder_tool],
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
-                    mode="AUTO", # 恢復智慧模式
+                    mode="AUTO", # 智慧判斷模式
                 )
             ),
             system_instruction=(
-                "你是一位行程秘書。請根據以下邏輯處理訊息：\n"
-                "【場景 A：記錄行程】\n"
-                "當使用者提到未來的計畫（如：明天要去...、幫我記下...）時，請『務必調用』save_reminder_tool。\n\n"
-                "【場景 B：回答問題】\n"
-                "當使用者詢問自己的行程（如：我明天要去哪？、我有什麼行程？）時，請『絕對不要』調用工具，"
-                "請直接根據下方的【個人行程 context】回答使用者。\n\n"
-                f"【個人行程 context】:\n{personal_context}"
+                "你是一位高效行程秘書。請遵守以下邏輯：\n"
+                "1. 當使用者提到計畫（如：明天要去...、記下...）時，『必須調用』save_reminder_tool。\n"
+                "2. 當使用者詢問行程（如：我明天要去哪？、我有什麼事？）時，『禁止調用工具』，"
+                "請直接根據下方的【個人行程記錄】回答使用者。\n\n"
+                f"【個人行程記錄】:\n{personal_context}"
             )
         )
         
@@ -96,34 +124,34 @@ def GEMINI_response(user_text, user_id):
             config=config
         )
 
-        # 這裡的解析邏輯要非常清楚
         if response.candidates and response.candidates[0].content.parts:
             parts = response.candidates[0].content.parts
             
-            # 先檢查是否有工具呼叫（優先處理記錄意圖）
+            # 優先處理 Function Call (記錄動作)
             for part in parts:
                 if part.function_call:
-                    print(f"DEBUG: [觸發記錄] AI 判定為新行程", flush=True)
+                    print(f"DEBUG: [意圖識別] AI 決定記錄行程", flush=True)
                     fn = part.function_call
                     extracted_text = fn.args.get("content", user_text)
                     success, msg = record_reminder(user_id, extracted_text)
                     return msg
             
-            # 如果沒有工具呼叫，則處理 AI 的文字回覆（回答問題）
+            # 處理一般文字回覆 (回答問題)
             for part in parts:
                 if part.text:
-                    print(f"DEBUG: [觸發對話] AI 判定為查詢或聊天", flush=True)
                     return part.text
 
-        return "我不確定如何處理這項訊息，您可以試著說『幫我記下...』或詢問『我明天有什麼行程？』"
+        return "我不確定這是否為一個行程，若要記錄請說『幫我記下...』"
         
     except Exception as e:
         print(f"❌ Gemini 錯誤:\n{traceback.format_exc()}", flush=True)
-        return "⚠️ 服務忙碌中，請稍後再試。"
-# ======================= Flask 路由 =======================
+        return "⚠️ 服務忙碌中，請稍後。"
+
+# ======================= Flask 路由與處理 =======================
 
 @app.route('/')
-def index(): return "✅ Alive"
+def index():
+    return "✅ LINE Bot is active!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -139,10 +167,7 @@ def callback():
 def handle_text_message(event):
     user_msg = event.message.text
     user_id = event.source.user_id
+    
     print(f"\n[User]: {user_msg}", flush=True)
     reply_text = GEMINI_response(user_msg, user_id)
-    print(f"[AI]: {reply_text}", flush=True)
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    print(f"[AI]: {reply_text}\n", flush=True)
